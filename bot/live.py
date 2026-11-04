@@ -77,6 +77,7 @@ class LiveListener:
         self.q: "queue.Queue[Optional[Utterance]]" = queue.Queue()
         self.stop_ev = threading.Event()
         self.lines: list[tuple[float, str, str]] = []  # (t, speaker, text) for "meeting so far"
+        self.stats = {"frames": 0, "utterances": 0, "transcribed": 0, "errors": 0}
         self._threads = [
             threading.Thread(target=self._monitor, name="live-monitor", daemon=True),
             threading.Thread(target=self._worker, name="live-worker", daemon=True),
@@ -89,6 +90,7 @@ class LiveListener:
         if self.stop_ev.is_set() or mono16k.size == 0:
             return
         now = time.monotonic()
+        self.stats["frames"] += 1
         with self.lock:
             b = self.bufs.get(user_id)
             if b is None:
@@ -104,6 +106,7 @@ class LiveListener:
         if b is None or b.samples < MIN_UTTERANCE_S * SR:
             return
         audio = np.concatenate(b.parts).astype(np.float32) / 32768.0
+        self.stats["utterances"] += 1
         if self.q.qsize() > 30:  # badly behind: drop oldest so commands stay responsive
             try:
                 self.q.get_nowait()
@@ -138,12 +141,14 @@ class LiveListener:
             try:
                 t = time.monotonic()
                 text = self._transcribe(u.audio)
+                self.stats["transcribed"] += 1
                 if text.lower().strip() in HALLUCINATIONS:
                     continue
                 self.lines.append((u.start, u.name, text))
-                log.debug("live %.1fs %s: %s (%.2fs)", u.start, u.name, text, time.monotonic() - t)
+                log.info("heard %s (%.1fs audio, %.1fs): %s", u.name, u.audio.size / SR, time.monotonic() - t, text[:120])
                 asyncio.run_coroutine_threadsafe(self.on_text(u.user_id, u.name, u.start, text), self.loop)
             except Exception:
+                self.stats["errors"] += 1
                 log.exception("live transcription failed")
 
     def close(self) -> None:

@@ -30,6 +30,15 @@ from .transcribe import transcribe_session_dir
 
 FOLLOWUP_WINDOW_S = 8.0  # after a bare "Rocky", the same speaker's next sentence is the command
 
+# voice_recv ships its UDP keepalive at 5000 *seconds*; without regular keepalives Discord stops
+# sending audio shortly after the bot joins. Same bug as Pycord-Development/pycord#3388.
+try:
+    from discord.ext.voice_recv import reader as _vr_reader
+
+    _vr_reader.UDPKeepAlive.delay = 5
+except Exception:  # pragma: no cover
+    pass
+
 log = logging.getLogger("minutes")
 
 
@@ -319,6 +328,7 @@ class MinutesBot(discord.Client):
                         f"about {self.cfg.publish_delay_seconds // 60} minutes after the meeting ends")
                 await post_notice(notes, f"Recording started in **{channel.name}**. Notes will be posted here {when}.")
             self._spawn(self._max_duration_guard(session))
+            self._spawn(self._health(session))
             return session
         except Exception:
             log.exception("could not start recording in %s/#%s", guild.name, channel.name)
@@ -328,6 +338,31 @@ class MinutesBot(discord.Client):
             if vc:
                 await vc.disconnect(force=True)
             return None
+
+    async def _health(self, session: Session, every: float = 20.0) -> None:
+        """Log whether audio is still arriving, so a silent bot is visible in the logs."""
+        last = 0
+        while True:
+            await asyncio.sleep(every)
+            if self.sessions.get(session.guild_id) is not session:
+                return
+            guild = self.get_guild(session.guild_id)
+            vc = guild.voice_client if guild else None
+            frames = session.sink.frames if session.sink else 0
+            diag = ""
+            try:
+                d = vc.get_recv_diagnostics() if vc is not None else {}
+                flat = {k: v for k, v in (d or {}).items() if isinstance(v, (int, float, str, bool))}
+                ds = (d or {}).get("dave_session") or {}
+                flat.update({f"dave_{k}": v for k, v in ds.items() if isinstance(v, (int, float, str, bool))})
+                diag = json.dumps(flat)[:500]
+            except Exception as e:
+                diag = f"n/a ({type(e).__name__})"
+            log.info("health #%s: audio frames +%d (total %d), connected=%s listening=%s, live=%s, recv=%s",
+                     session.channel_name, frames - last, frames,
+                     bool(vc and vc.is_connected()), bool(vc and getattr(vc, "is_listening", lambda: False)()),
+                     session.live.stats if session.live else None, diag)
+            last = frames
 
     async def _max_duration_guard(self, session: Session) -> None:
         await asyncio.sleep(self.cfg.max_meeting_hours * 3600)
