@@ -55,6 +55,11 @@ class Indexer:
         is_minutes = minutes_channel_id is not None and m.channel.id == minutes_channel_id
         if m.author.bot and not is_minutes:
             return
+        # questions addressed to a bot ("@Rocky ...") are not knowledge
+        lead = (m.content or "").lstrip()
+        if lead.startswith("<@") and (any(u.bot for u in m.mentions) or any(r.managed for r in m.role_mentions)):
+            self.kb.delete(message_key(m))
+            return
         parts = [m.content or ""]
         for a in m.attachments:
             parts.append(f"[attachment: {a.filename}] {a.url}")

@@ -52,15 +52,22 @@ _STOP = re.compile(r"^(?:please\s+)?(?:stop|end|pause|quit)\s+(?:the\s+)?(?:reco
 _NOTES = re.compile(
     r"^(?:please\s+)?(?:take|post|send|publish|make|write|drop|give\s+us)\s+(?:the\s+|our\s+)?(?:notes|minutes|summary)\b", re.I
 )
-_HELP = re.compile(r"^(?:help|what can you do|commands|what are your commands)\b", re.I)
+_HELP = re.compile(r"^(?:help|what can you do|commands|what are your commands|voice commands)\b", re.I)
+_DOCS = re.compile(
+    r"^(?:(?:list|show|what are|pull up|give me|send)\s+)?(?:all\s+|the\s+|our\s+|me\s+)*(?:docs|documents|files|google docs|links)"
+    r"(?:\s+(?:you have|we have|you know|you know about|you can see|list))?\??$"
+    r"|^what\s+(?:docs|documents|files)\s+(?:do\s+(?:you|we)\s+have|can\s+you\s+see)\??$", re.I)
 
 
 def parse_command(text: str) -> Command:
     t = (text or "").strip().strip(".!")
+    t = re.sub(r"^/(?:ask|minutes)\s*", "", t)  # "@Rocky /ask docs" typed as plain text
     if not t:
         return Command("help")
     if _HELP.match(t):
         return Command("help")
+    if _DOCS.match(t):
+        return Command("docs")
     if _STOP.match(t):
         return Command("stop")
     if _NOTES.match(t):
@@ -76,6 +83,7 @@ def parse_command(text: str) -> Command:
 
 HELP_TEXT = (
     "**Rocky commands** (say \"Rocky, ...\" in voice or @Rocky in text)\n"
+    "`docs`: lists every Google Doc, Sheet and Slides file I can see\n"
     "`pull up <topic>`: finds the doc, sheet, slides or message and posts the link\n"
     "`<any question>`: answers from channel history, shared Google files and past meetings\n"
     "`action item: <who> <does what> <by when>`: logs it into this meeting's notes\n"
@@ -100,10 +108,28 @@ def format_find(query: str, hits: list[Hit], limit: int = 3) -> str:
         meta = " · ".join(x for x in (where, h.author, _when(h.ts)) if x)
         title = h.title or h.snippet[:80] or "message"
         if h.kind in ("msg", "minutes", "meeting"):
-            snippet = h.snippet.replace("\n", " ")[:180]
-            lines.append(f"• {snippet}\n  {meta} · <{h.url}>" if h.url else f"• {snippet}\n  {meta}")
+            snippet = _clean(h.snippet)[:180]
+            link = f" · [jump]({h.url})" if h.url else ""
+            lines.append(f"• {snippet}\n  {meta}{link}")
         else:
-            lines.append(f"• **{title}**\n  <{h.url}>\n  {meta}")
+            lines.append(f"• [**{_clean(title)}**]({h.url})\n  {meta}")
+    return "\n".join(lines)
+
+
+def _clean(s: str) -> str:
+    """Neutralize mentions and squash whitespace so quoted text can't ping anyone."""
+    s = re.sub(r"<@[!&]?\d+>", "@someone", s or "")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def format_docs(files: list[tuple[str, str, str]]) -> str:
+    if not files:
+        return ("I don't see any Google Docs, Sheets or Slides yet. Post a link in any channel "
+                "(shared as \"anyone with the link can view\") and I'll pick it up.")
+    lines = [f"**Files I can search ({len(files)})**"]
+    for title, url, status in files[:25]:
+        note = "" if status == "ok" else " (link only, not shared publicly)"
+        lines.append(f"• [{_clean(title)}]({url}){note}")
     return "\n".join(lines)
 
 

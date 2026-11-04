@@ -182,6 +182,15 @@ class KnowledgeBase:
                             (time.time(), status, title, file_id))
             self.db.commit()
 
+    def list_files(self, guild_id: int) -> list[tuple[str, str, str]]:
+        """(title, url, status) for every Google file seen in this guild, newest first."""
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT kind, coalesce(nullif(title, ''), context), url, status FROM files WHERE guild_id = ? ORDER BY ts DESC",
+                (guild_id,),
+            ).fetchall()
+        return [(f"{KIND_LABEL.get(k, 'File')}: {t or 'untitled'}", u, s) for k, t, u, s in rows]
+
     # reads ----------------------------------------------------------------
     def search(self, text: str, guild_id: Optional[int] = None, kinds: Optional[Iterable[str]] = None,
                limit: int = 8) -> list[Hit]:

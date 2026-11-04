@@ -106,3 +106,19 @@ def test_live_listener_endpointing():
     lst = asyncio.run(run())
     assert heard == [(1, "fire", "len=16000")]
     assert "fire: len=16000" in lst.transcript_so_far()
+
+
+def test_docs_and_slash_prefix():
+    for t in ("/ask docs", "docs", "list docs", "what docs do you have?", "show me all the files", "/ask list documents"):
+        assert parse_command(t).kind == "docs", t
+    assert parse_command("/ask pull up the risk register").kind == "find"
+    assert parse_command("pull up the doc about docs").kind == "find"
+
+
+def test_format_docs_and_mentions():
+    from bot.assistant import format_docs, _clean
+    assert "Post a link" in format_docs([])
+    out = format_docs([("Google Doc: Org Chart", "https://docs.google.com/document/d/x", "ok"),
+                       ("Google Sheet: Budget", "https://docs.google.com/spreadsheets/d/y", "private")])
+    assert "[Google Doc: Org Chart](https://docs.google.com/document/d/x)" in out and "link only" in out
+    assert _clean("<@123> hi <@&456>") == "@someone hi @someone"

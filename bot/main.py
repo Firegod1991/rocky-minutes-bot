@@ -15,7 +15,7 @@ import discord
 from discord import app_commands
 from discord.ext import voice_recv
 
-from .assistant import HELP_TEXT, answer_question, format_find, parse_command, parse_wake, wake_pattern
+from .assistant import HELP_TEXT, answer_question, format_docs, format_find, parse_command, parse_wake, wake_pattern
 from .config import Config
 from .indexer import Indexer
 from .knowledge import KnowledgeBase
@@ -489,6 +489,8 @@ class MinutesBot(discord.Client):
         kb = self.coord.kb
         if cmd.kind == "help":
             return await reply(HELP_TEXT)
+        if cmd.kind == "docs":
+            return await reply(format_docs(kb.list_files(guild.id)))
         if cmd.kind == "find":
             hits = kb.search(cmd.arg, guild_id=guild.id, kinds=("gdoc", "file"), limit=3)
             if not hits:
@@ -554,14 +556,13 @@ class MinutesBot(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         if not self.primary or not self.cfg.text_commands or message.guild is None:
             return
-        try:
-            self.coord.indexer.index_message(message, self.settings.get_channel_id(message.guild.id))
-        except Exception:
-            log.exception("indexing failed")
-        if message.author.bot:
-            return
-        text = self._addressed(message)
+        text = None if message.author.bot else self._addressed(message)
         if text is None:
+            # questions to Rocky are not knowledge; only index everything else
+            try:
+                self.coord.indexer.index_message(message, self.settings.get_channel_id(message.guild.id))
+            except Exception:
+                log.exception("indexing failed")
             return
         owner, session = self._session_for(message.author)
         asker = message.author.display_name
