@@ -21,7 +21,7 @@ from .speech import Speaker, speakable
 from .config import Config
 from .indexer import Indexer
 from .knowledge import KnowledgeBase
-from .live import LiveListener
+from .live import LiveListener, get_live_model
 from .merge import Segment, chunk_text, coalesce, render_transcript
 from .minutes import generate_minutes
 from .publisher import Settings, get_minutes_channel, post_minutes, post_notice, post_transcript_thread
@@ -115,7 +115,7 @@ class MinutesBot(discord.Client):
         self.sessions_dir = cfg.data_dir / "sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self.executor = coord.executor
-        self.speaker = Speaker(cfg.piper_dir, cfg.tts_voice)
+        self.speaker = Speaker(cfg.tts_dir / cfg.tts_engine, cfg.voice_name, cfg.tts_engine, cfg.tts_speed)
         self._bg: set[asyncio.Task] = set()
         if self.primary:
             self._register_commands()
@@ -142,6 +142,14 @@ class MinutesBot(discord.Client):
         # catch meetings already in progress when the bot starts
         for guild in self.guilds:
             await self._scan_guild(guild)
+        if not getattr(self, "_warmed", False):
+            # load the voice and the live listener now so the first reply has no cold start
+            self._warmed = True
+            loop = asyncio.get_running_loop()
+            if self.cfg.voice_replies:
+                loop.run_in_executor(None, self.speaker.warm)
+            if self.cfg.voice_commands:
+                loop.run_in_executor(None, get_live_model, self.cfg.live_model)
         if self.primary and self.cfg.text_commands and not getattr(self, "_backfilled", False):
             self._backfilled = True
             for guild in self.guilds:

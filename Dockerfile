@@ -20,9 +20,8 @@ ARG WHISPER_MODEL=small
 ARG WHISPER_LIVE_MODEL=base.en
 RUN python -c "from faster_whisper import WhisperModel; [WhisperModel(m, device='cpu', compute_type='int8') for m in ('${WHISPER_MODEL}', '${WHISPER_LIVE_MODEL}')]"
 
-# Rocky's speaking voice (local Piper text to speech)
-ARG TTS_VOICE=en_US-ryan-high
-RUN python -m piper.download_voices --download-dir /models/piper ${TTS_VOICE}
+# Rocky's speaking voice: Kokoro (natural sounding local text to speech)
+RUN python -c "import urllib.request,os;d='/models/tts/kokoro';os.makedirs(d,exist_ok=True);b='https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/';[urllib.request.urlretrieve(b+f,os.path.join(d,f)) for f in ('kokoro-v1.0.int8.onnx','voices-v1.0.bin')]"
 
 # code last, so code changes don't re-download the models
 COPY bot ./bot

@@ -164,7 +164,7 @@ def test_cloud_failure_falls_back_to_ollama(monkeypatch):
     from bot.config import Config
     seen = []
 
-    async def fake(cfg, p, system, user, max_tokens):
+    async def fake(cfg, p, system, user, max_tokens, fast=False):
         seen.append(p)
         if p == "gemini":
             raise RuntimeError("404 model retired")
@@ -174,6 +174,23 @@ def test_cloud_failure_falls_back_to_ollama(monkeypatch):
     cfg = Config(discord_token="x", anthropic_api_key="", gemini_api_key="g", ollama_url="http://x")
     assert asyncio.run(llm.complete(cfg, "s", "u")) == "local answer"
     assert seen == ["gemini", "ollama"]
+
+
+def test_sentences_split_and_glue():
+    from bot.speech import sentences
+    assert sentences("Found it. Link's in the chat. Ok.") == ["Found it. Link's in the chat. Ok."] or \
+        sentences("Found it. Link's in the chat. Ok.") == ["Found it.", "Link's in the chat. Ok."]
+    assert sentences("The rover weighs about 155 kilograms. We have twelve kilograms of margin left.") == [
+        "The rover weighs about 155 kilograms.", "We have twelve kilograms of margin left."]
+
+
+def test_streaming_source_frames():
+    import threading
+    from bot.speech import FRAME, StreamingPCM
+    src = StreamingPCM(lead_ms=0)
+    threading.Timer(0.05, lambda: (src.feed(b"\x01" * (FRAME + 100)), src.finish())).start()
+    a, b, c = src.read(), src.read(), src.read()
+    assert len(a) == FRAME and len(b) == FRAME and b.endswith(b"\x00") and c == b""
 
 
 def test_speakable_strips_chat_formatting():

@@ -20,7 +20,7 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 SR = 16_000
-END_SILENCE_S = 0.8  # pause that closes an utterance
+END_SILENCE_S = 0.6  # pause that closes an utterance
 MAX_UTTERANCE_S = 15.0
 MIN_UTTERANCE_S = 0.35
 HALLUCINATIONS = {
@@ -145,7 +145,7 @@ class LiveListener:
                 if text.lower().strip() in HALLUCINATIONS:
                     continue
                 self.lines.append((u.start, u.name, text))
-                log.info("heard %s (%.1fs audio, %.1fs): %s", u.name, u.audio.size / SR, time.monotonic() - t, text[:120])
+                log.debug("heard %s (%.1fs audio, %.1fs): %s", u.name, u.audio.size / SR, time.monotonic() - t, text[:120])
                 asyncio.run_coroutine_threadsafe(self.on_text(u.user_id, u.name, u.start, text), self.loop)
             except Exception:
                 self.stats["errors"] += 1

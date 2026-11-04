@@ -45,6 +45,8 @@ class Config:
     # Google Gemini (key from https://aistudio.google.com/apikey). Used when set and no Anthropic key.
     gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
     gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-3.5-flash"))
+    # spoken answers use a lighter model for speed
+    gemini_fast_model: str = field(default_factory=lambda: os.getenv("GEMINI_FAST_MODEL", "gemini-3.5-flash-lite"))
     # Free local fallback when no cloud key is set. Empty OLLAMA_URL disables it.
     ollama_url: str = field(default_factory=lambda: os.getenv("OLLAMA_URL", "http://host.docker.internal:11434"))
     ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "qwen3:8b"))
@@ -84,8 +86,15 @@ class Config:
     live_model: str = field(default_factory=lambda: os.getenv("WHISPER_LIVE_MODEL", "base.en"))
     # Rocky answers out loud in voice channels (local Piper text to speech)
     voice_replies: bool = field(default_factory=lambda: _bool("VOICE_REPLIES", True))
-    tts_voice: str = field(default_factory=lambda: os.getenv("TTS_VOICE", "en_US-ryan-high"))
-    piper_dir: Path = field(default_factory=lambda: Path(os.getenv("PIPER_DIR", "/models/piper")))
+    # kokoro (natural, default) or piper (lighter); voice names differ per engine
+    tts_engine: str = field(default_factory=lambda: os.getenv("TTS_ENGINE", "kokoro").strip().lower())
+    tts_voice: str = field(default_factory=lambda: os.getenv("TTS_VOICE", ""))
+    tts_speed: float = field(default_factory=lambda: float(os.getenv("TTS_SPEED", "1.05") or 1.05))
+    tts_dir: Path = field(default_factory=lambda: Path(os.getenv("TTS_DIR", "/models/tts")))
+
+    @property
+    def voice_name(self) -> str:
+        return self.tts_voice or ("am_michael" if self.tts_engine == "kokoro" else "en_US-ryan-high")
     index_history_limit: int = field(default_factory=lambda: _int("INDEX_HISTORY_LIMIT", 2000))
     doc_refresh_hours: int = field(default_factory=lambda: _int("DOC_REFRESH_HOURS", 6))
 

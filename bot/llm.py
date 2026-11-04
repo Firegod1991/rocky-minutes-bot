@@ -25,19 +25,19 @@ def enabled(cfg: Config) -> bool:
     return bool(provider(cfg))
 
 
-async def complete(cfg: Config, system: str, user: str, max_tokens: int = 1500) -> str:
+async def complete(cfg: Config, system: str, user: str, max_tokens: int = 1500, fast: bool = False) -> str:
     """Ask the configured cloud model; if it fails, fall back to local Ollama when available."""
     p = provider(cfg)
     try:
-        return await _complete(cfg, p, system, user, max_tokens)
+        return await _complete(cfg, p, system, user, max_tokens, fast)
     except Exception:
         if p != "ollama" and cfg.ollama_url and cfg.ollama_model:
             log.exception("%s failed; falling back to local Ollama", p)
-            return await _complete(cfg, "ollama", system, user, max_tokens)
+            return await _complete(cfg, "ollama", system, user, max_tokens, fast)
         raise
 
 
-async def _complete(cfg: Config, p: str, system: str, user: str, max_tokens: int) -> str:
+async def _complete(cfg: Config, p: str, system: str, user: str, max_tokens: int, fast: bool = False) -> str:
     if p == "claude":
         from anthropic import AsyncAnthropic
 
@@ -51,16 +51,18 @@ async def _complete(cfg: Config, p: str, system: str, user: str, max_tokens: int
         # Gemini's OpenAI compatible endpoint
         url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         body = {
-            "model": cfg.gemini_model,
+            # fast = spoken replies: smaller model, no thinking pass
+            "model": cfg.gemini_fast_model if fast else cfg.gemini_model,
             # thinking tokens count against max_tokens on Gemini 3.x: keep thinking light and leave headroom
-            "reasoning_effort": "low",
+            "reasoning_effort": "none" if fast else "low",
             "max_tokens": max_tokens + 2048,
             "temperature": 0.2,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         }
         headers = {"Authorization": f"Bearer {cfg.gemini_api_key}"}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as s:
-            for attempt, wait in enumerate((2, 5, 0)):
+            # spoken replies can't wait on backoff: one try, then the local fallback
+            for attempt, wait in enumerate((0,) if fast else (2, 5, 0)):
                 async with s.post(url, json=body, headers=headers) as r:
                     if r.status == 200:
                         data = await r.json()

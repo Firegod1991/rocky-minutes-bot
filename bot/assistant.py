@@ -194,7 +194,7 @@ async def answer_with_hits(cfg: Config, kb: KnowledgeBase, guild_id: int, questi
     if meeting_so_far:
         content += f"\n\n<live_meeting_transcript>\n{meeting_so_far[-(6000 if local else 12000):]}\n</live_meeting_transcript>"
     try:
-        text = await llm.complete(cfg, VOICE_SYSTEM if spoken else ASK_SYSTEM, content, 300 if spoken else 600)
+        text = await llm.complete(cfg, VOICE_SYSTEM if spoken else ASK_SYSTEM, content, 300 if spoken else 600, fast=spoken)
         return (text or format_find(question, hits)), hits
     except Exception:
         log.exception("answer failed")
