@@ -25,7 +25,18 @@ def enabled(cfg: Config) -> bool:
 
 
 async def complete(cfg: Config, system: str, user: str, max_tokens: int = 1500) -> str:
+    """Ask the configured cloud model; if it fails, fall back to local Ollama when available."""
     p = provider(cfg)
+    try:
+        return await _complete(cfg, p, system, user, max_tokens)
+    except Exception:
+        if p != "ollama" and cfg.ollama_url and cfg.ollama_model:
+            log.exception("%s failed; falling back to local Ollama", p)
+            return await _complete(cfg, "ollama", system, user, max_tokens)
+        raise
+
+
+async def _complete(cfg: Config, p: str, system: str, user: str, max_tokens: int) -> str:
     if p == "claude":
         from anthropic import AsyncAnthropic
 
