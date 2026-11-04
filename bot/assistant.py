@@ -123,14 +123,28 @@ def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def format_docs(files: list[tuple[str, str, str]]) -> str:
-    if not files:
-        return ("I don't see any Google Docs, Sheets or Slides yet. Post a link in any channel "
-                "(shared as \"anyone with the link can view\") and I'll pick it up.")
-    lines = [f"**Files I can search ({len(files)})**"]
-    for title, url, status in files[:25]:
-        note = "" if status == "ok" else " (link only, not shared publicly)"
-        lines.append(f"• [{_clean(title)}]({url}){note}")
+def format_docs(files: list[tuple[str, str, str]], folders: list[dict] | None = None,
+                drive_files: list[tuple[str, str, str]] | None = None, share_with: str = "") -> str:
+    folders, drive_files = folders or [], drive_files or []
+    if not files and not folders and not drive_files:
+        return ("I don't see any Google files yet. Post a Doc, Sheet, Slides or Drive folder link in any channel "
+                "and I'll pick it up.")
+    lines = []
+    if folders:
+        lines.append(f"**Drive folders ({len(folders)})**")
+        for f in folders[:10]:
+            state = {"ok": f"{f.get('files', 0)} files", "no_access": f"can't open it, share it with `{share_with}` as Viewer"
+                     if share_with else "can't open it", "no_credentials": "Drive access isn't set up yet",
+                     "new": "reading now"}.get(f.get("status"), f.get("status", ""))
+            lines.append(f"• [{_clean(f.get('name') or 'Drive folder')}]({f['url']}): {state}")
+    total = len(files) + len(drive_files)
+    if total:
+        lines.append(f"**Files I can search ({total})**")
+        for title, url, status in (drive_files + files)[:30]:
+            note = "" if status == "ok" else " (link only, not shared publicly)"
+            lines.append(f"• [{_clean(title)}]({url}){note}")
+        if total > 30:
+            lines.append(f"…and {total - 30} more")
     return "\n".join(lines)
 
 

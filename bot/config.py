@@ -95,6 +95,9 @@ class Config:
     @property
     def voice_name(self) -> str:
         return self.tts_voice or ("am_michael" if self.tts_engine == "kokoro" else "en_US-ryan-high")
+    # Google Drive folders (read only). Service account key file, or an API key for public folders.
+    google_sa_file: Path = field(default_factory=lambda: Path(os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "/data/google-service-account.json")))
+    google_api_key: str = field(default_factory=lambda: os.getenv("GOOGLE_API_KEY", ""))
     index_history_limit: int = field(default_factory=lambda: _int("INDEX_HISTORY_LIMIT", 2000))
     doc_refresh_hours: int = field(default_factory=lambda: _int("DOC_REFRESH_HOURS", 6))
 

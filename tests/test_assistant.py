@@ -117,7 +117,7 @@ def test_docs_and_slash_prefix():
 
 def test_format_docs_and_mentions():
     from bot.assistant import format_docs, _clean
-    assert "Post a link" in format_docs([])
+    assert "Drive folder link" in format_docs([])
     out = format_docs([("Google Doc: Org Chart", "https://docs.google.com/document/d/x", "ok"),
                        ("Google Sheet: Budget", "https://docs.google.com/spreadsheets/d/y", "private")])
     assert "[Google Doc: Org Chart](https://docs.google.com/document/d/x)" in out and "link only" in out

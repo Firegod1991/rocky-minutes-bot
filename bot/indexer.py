@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 
 import discord
 
+from .drive import folder_links
 from .knowledge import KIND_LABEL, KnowledgeBase, fetch_google_file, google_links, title_from_text
 
 if TYPE_CHECKING:
@@ -33,6 +34,8 @@ class Indexer:
         self._http = None
         self._tasks: list[asyncio.Task] = []
         self.backfill_done = asyncio.Event()
+        self.drive = None  # DriveIndexer, set by the bot when Drive is configured
+        self.on_new_folder = None  # async callback(folder dict, message) for live folder posts
 
     # lifecycle ------------------------------------------------------------
     def start(self) -> None:
@@ -73,6 +76,12 @@ class Indexer:
         author = getattr(m.author, "display_name", None) or m.author.name
         self.kb.upsert(message_key(m), kind, m.guild.id, label, author, m.jump_url,
                        (m.content or "")[:80], body, m.created_at.timestamp())
+        if self.drive is not None:
+            for folder_id, url in folder_links(body):
+                if self.drive.add_folder(folder_id, m.guild.id, url, author):
+                    folder = next(f for f in self.drive.folders(m.guild.id) if f["folder_id"] == folder_id)
+                    cb = self.on_new_folder
+                    asyncio.get_running_loop().create_task(cb(folder, m) if cb else self.drive.crawl(folder))
         for gkind, fid, url in google_links(body):
             self.kb.note_file(gkind, fid, url, m.guild.id, label, author, m.content or "", m.created_at.timestamp())
             self.queue.put_nowait(fid)

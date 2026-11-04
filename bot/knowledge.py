@@ -191,6 +191,15 @@ class KnowledgeBase:
             ).fetchall()
         return [(f"{KIND_LABEL.get(k, 'File')}: {t or 'untitled'}", u, s) for k, t, u, s in rows]
 
+    def list_drive_files(self, guild_id: int) -> list[tuple[str, str, str]]:
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT title, url, min(channel) FROM kb WHERE kind = 'gdoc' AND guild_id = ? AND url LIKE 'https://%' "
+                "AND rowid IN (SELECT rid FROM keys WHERE key LIKE 'gdrive:%') GROUP BY url ORDER BY 3, 1",
+                (guild_id,),
+            ).fetchall()
+        return [(t, u, "ok") for t, u, _ in rows]
+
     # reads ----------------------------------------------------------------
     def search(self, text: str, guild_id: Optional[int] = None, kinds: Optional[Iterable[str]] = None,
                limit: int = 8) -> list[Hit]:

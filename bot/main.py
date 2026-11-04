@@ -19,6 +19,7 @@ from .assistant import (HELP_TEXT, answer_question, answer_with_hits, format_doc
                         parse_wake, source_links, wake_pattern)
 from .speech import Speaker, speakable
 from .config import Config
+from .drive import DriveAuth, DriveIndexer
 from .indexer import Indexer
 from .knowledge import KnowledgeBase
 from .live import LiveListener, get_live_model
@@ -73,6 +74,8 @@ class Coordinator:
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper")
         self.kb = KnowledgeBase(cfg.data_dir / "knowledge.db")
         self.indexer = Indexer(cfg, self.kb)
+        self.drive = DriveIndexer(self.kb, DriveAuth(cfg.google_sa_file, cfg.google_api_key), cfg.doc_refresh_hours)
+        self.indexer.drive = self.drive
         self.wake = wake_pattern(cfg.wake_words)
         # channels told to stop by voice/text; Rocky stays out until they empty
         self.paused: set[tuple[int, int]] = set()
@@ -135,6 +138,8 @@ class MinutesBot(discord.Client):
             await self.tree.sync()
             log.info("slash commands synced globally (can take up to an hour to appear)")
         self.coord.indexer.start()
+        self.coord.indexer.on_new_folder = self._on_new_folder
+        self._spawn(self.coord.drive.refresh_loop())
         self._spawn(self._resume_unprocessed())
 
     async def on_ready(self) -> None:
@@ -562,10 +567,13 @@ class MinutesBot(discord.Client):
                   "take notes now, or stop recording. Full list is in the chat.")
             return await reply(HELP_TEXT)
         if cmd.kind == "docs":
-            files = kb.list_files(guild.id)
-            speak(f"I can see {len(files)} shared file{'s' if len(files) != 1 else ''}. The list is in the chat."
-                  if files else "I don't see any shared Google files yet.")
-            return await reply(format_docs(files))
+            files, drive_files = kb.list_files(guild.id), kb.list_drive_files(guild.id)
+            folders = self.coord.drive.folders(guild.id)
+            n = len(files) + len(drive_files)
+            speak(f"I can search {n} file{'s' if n != 1 else ''}"
+                  + (f" across {len(folders)} Drive folder{'s' if len(folders) != 1 else ''}" if folders else "")
+                  + ". The list is in the chat." if n or folders else "I don't see any shared Google files yet.")
+            return await reply(format_docs(files, folders, drive_files, self.coord.drive.auth.account_email()))
         if cmd.kind == "find":
             hits = kb.search(cmd.arg, guild_id=guild.id, kinds=("gdoc", "file"), limit=3)
             if not hits:
@@ -610,6 +618,24 @@ class MinutesBot(discord.Client):
             await owner.end_session(session.guild_id, reason="notes requested")
             if ch is not None and _humans(ch):
                 await owner.start_session(ch)
+
+    async def _on_new_folder(self, folder: dict, message: discord.Message) -> None:
+        """Someone posted a Drive folder link: read it and say how it went, in that channel."""
+        drive = self.coord.drive
+        if not drive.auth.mode:
+            return await self._send(message.channel, "I see a Google Drive folder link, but Drive access isn't set up "
+                                                     "for me yet, so I can only use files posted individually.")
+        status = await drive.crawl(folder)
+        info = next((f for f in drive.folders(folder["guild_id"]) if f["folder_id"] == folder["folder_id"]), folder)
+        if status == "ok":
+            await self._send(message.channel, f"Read the Drive folder **{info.get('name')}** and its subfolders: "
+                                              f"{info.get('files', 0)} files are now searchable. I re-check it every "
+                                              f"{self.cfg.doc_refresh_hours} hours. Read only, I can't edit anything.")
+        elif status == "no_access":
+            who = drive.auth.account_email()
+            await self._send(message.channel, "I can't open that Drive folder. Share it with "
+                                              f"`{who}` as **Viewer**, then post the link again." if who else
+                                              "I can't open that Drive folder. Make sure it's shared with me, then post it again.")
 
     async def _send(self, channel, text: str) -> None:
         for chunk in chunk_text(text, 1900):

@@ -8,3 +8,6 @@ anthropic==2.4.0
 numpy>=2.0,<3
 piper-tts==1.8.0
 kokoro-onnx==0.6.1
+google-auth==2.38.0
+requests>=2.31
+pypdf==5.4.0
