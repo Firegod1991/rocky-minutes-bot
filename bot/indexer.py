@@ -85,16 +85,20 @@ class Indexer:
                 continue
             n = 0
             try:
-                async for m in ch.history(limit=limit, oldest_first=False):
-                    self.index_message(m, minutes_channel_id)
-                    n += 1
-                # active threads under text channels
-                for th in getattr(ch, "threads", []):
-                    async for m in th.history(limit=limit):
+                # some channels make Discord's history call hang; never let one block the rest
+                async with asyncio.timeout(60):
+                    async for m in ch.history(limit=limit, oldest_first=False):
                         self.index_message(m, minutes_channel_id)
                         n += 1
+                    # active threads under text channels
+                    for th in getattr(ch, "threads", []):
+                        async for m in th.history(limit=limit):
+                            self.index_message(m, minutes_channel_id)
+                            n += 1
             except discord.Forbidden:
                 continue
+            except TimeoutError:
+                log.warning("backfill timed out for #%s after %d messages; skipping", ch.name, n)
             except Exception:
                 log.warning("backfill failed for #%s", ch.name, exc_info=True)
             total += n

@@ -35,6 +35,11 @@ def _slug(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]+", "-", s).strip("-").lower() or "voice"
 
 
+def _log_task_error(t: asyncio.Task) -> None:
+    if not t.cancelled() and t.exception() is not None:
+        log.error("background task failed", exc_info=t.exception())
+
+
 def _humans(channel: discord.abc.Connectable) -> list[discord.Member]:
     return [m for m in getattr(channel, "members", []) if not m.bot]
 
@@ -161,6 +166,7 @@ class MinutesBot(discord.Client):
         t = asyncio.create_task(coro)
         self._bg.add(t)
         t.add_done_callback(self._bg.discard)
+        t.add_done_callback(_log_task_error)
         return t
 
     # voice events ---------------------------------------------------------
