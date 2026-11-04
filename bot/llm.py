@@ -54,7 +54,7 @@ async def _complete(cfg: Config, p: str, system: str, user: str, max_tokens: int
             # fast = spoken replies: smaller model, no thinking pass
             "model": cfg.gemini_fast_model if fast else cfg.gemini_model,
             # thinking tokens count against max_tokens on Gemini 3.x: keep thinking light and leave headroom
-            "reasoning_effort": "none" if fast else "low",
+            "reasoning_effort": "low",  # "none" is rejected by the lite models
             "max_tokens": max_tokens + 2048,
             "temperature": 0.2,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
