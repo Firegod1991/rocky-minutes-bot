@@ -49,6 +49,14 @@ _ACTION = re.compile(
     r"^(?:please\s+)?(?:add\s+(?:an?\s+)?|log\s+(?:an?\s+)?|new\s+|note\s+(?:an?\s+)?)?(?:action\s+items?|to\s*do|task)\s*[:,.-]?\s*(?P<item>.+)$",
     re.IGNORECASE,
 )
+_RESEARCH = re.compile(
+    r"^(?:can you |could you |please |go ahead and )*"
+    r"(?:research|do (?:some )?research on|google|search (?:the )?(?:web|internet|online)(?:\s+for)?|"
+    r"look (?:it |this |that )?up online|look online(?:\s+for)?|check online(?:\s+for)?|"
+    r"what does the (?:web|internet) say about|find online)\s+(?P<q>.+)$"
+    r"|^(?:can you |could you |please )*(?:look up|search(?: for)?|find|check|google)\s+(?P<q2>.+?)\s+(?:online|on the (?:web|internet))\??$",
+    re.IGNORECASE,
+)
 _STOP = re.compile(r"^(?:please\s+)?(?:stop|end|pause|quit)\s+(?:the\s+)?(?:recording|meeting|notes|listening|taking notes)\b", re.I)
 _NOTES = re.compile(
     r"^(?:please\s+)?(?:take|post|send|publish|make|write|drop|give\s+us)\s+(?:the\s+|our\s+)?(?:notes|minutes|summary)\b", re.I
@@ -73,6 +81,9 @@ def parse_command(text: str) -> Command:
         return Command("stop")
     if _NOTES.match(t):
         return Command("notes")
+    m = _RESEARCH.match(t)
+    if m:
+        return Command("research", (m.group("q") or m.group("q2")).strip())
     m = _ACTION.match(t)
     if m:
         return Command("action", m.group("item").strip())
@@ -86,6 +97,7 @@ HELP_TEXT = (
     "**Rocky commands** (say \"Rocky, ...\" in voice or @Rocky in text)\n"
     "`docs`: lists every Google Doc, Sheet and Slides file I can see\n"
     "`pull up <topic>`: finds the doc, sheet, slides or message and posts the link\n"
+    "`research <topic>`: looks it up on the web (also used when our own docs don't have the answer)\n"
     "`<any question>`: answers from channel history, shared Google files and past meetings\n"
     "`action item: <who> <does what> <by when>`: logs it into this meeting's notes\n"
     "`take notes now`: posts notes for the meeting so far and keeps recording\n"
@@ -164,16 +176,16 @@ def sources_block(hits: list[Hit], max_chars: int = 14_000) -> str:
 DOC_RULES = (
     "Sources may be spreadsheet rows written as 'Column: value' pairs, tagged with the tab name in brackets. "
     "Read the column names carefully (mass each vs total mass, price each vs total). When the question needs a "
-    "total, difference or margin, compute it from the rows and show the numbers you used. Say how current a value "
-    "is when the source gives a date or a status such as Picked, Leading, Open or TBD. "
+    "total, difference or margin, compute it from the rows. When sources disagree, use the most recent value "
+    "(latest date or version) and give only that. Never mention dates, document names, file names, sheet tabs or "
+    "where the info came from; just state the answer directly, like a teammate who knows it. "
 )
 
 ASK_SYSTEM = (
     "You are Rocky, the assistant inside a team's Discord server. Answer the question using only the sources "
     "and the live meeting transcript provided. " + DOC_RULES + "Be brief: under 120 words unless the question needs more. "
-    "Cite sources inline as [1], [2] and end with the links you cited, one per line, wrapped in <> so Discord "
-    "does not embed them. If the sources do not contain the answer, say so in one sentence and suggest where "
-    "it might be. Use plain Discord markdown. Do not use hyphens or em dashes; use commas or new sentences."
+    "Give just the answer: no citations like [1], no links, no file paths or document names unless the "
+    "question asks where something is. If the sources do not contain the answer, reply with exactly NO_ANSWER and nothing else. Use plain Discord markdown. Do not use hyphens or em dashes; use commas or new sentences."
 )
 
 
@@ -182,23 +194,19 @@ VOICE_SYSTEM = (
     "meeting transcript provided. " + DOC_RULES + "Reply in one to three short spoken sentences: plain conversational English, no lists, "
     "no links, no citations, no markdown, numbers written the way you'd say them. Personality: calm, precise, dry and "
     "deadpan, like a seasoned mission robot; a brief wry aside is fine now and then, but the answer always comes first. "
-    "If the sources don't have the answer, say so in one sentence and say where it might be found."
+    "If the sources don't have the answer, reply with exactly NO_ANSWER and nothing else."
 )
+
+
+def strip_refs(text: str) -> str:
+    """Answer only: drop [1] style citations and bare source links the model may still add."""
+    t = re.sub(r"\s*\[(?:\d+(?:,\s*)?)+\]", "", text or "")
+    t = re.sub(r"^\s*<?https?://\S+>?\s*$", "", t, flags=re.M)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
 
 
 def embedder_for(cfg: Config) -> Embedder | None:
     return Embedder(cfg.ollama_url, cfg.embed_model) if (cfg.ollama_url and cfg.embed_model) else None
-
-
-def source_links(hits: list[Hit], limit: int = 3) -> str:
-    out, seen = [], set()
-    for h in hits:
-        if len(out) >= limit or not h.url or h.url in seen:
-            continue
-        seen.add(h.url)
-        label = _clean(h.title if h.is_file else (h.snippet or h.title))[:70] or "source"
-        out.append(f"[{label}]({h.url})")
-    return ("Sources: " + " · ".join(out)) if out else ""
 
 
 async def answer_question(cfg: Config, kb: KnowledgeBase, guild_id: int, question: str, asker: str,
@@ -221,10 +229,42 @@ async def answer_with_hits(cfg: Config, kb: KnowledgeBase, guild_id: int, questi
     if meeting_so_far:
         content += f"\n\n<live_meeting_transcript>\n{meeting_so_far[-(6000 if local else 12000):]}\n</live_meeting_transcript>"
     try:
-        text = await llm.complete(cfg, VOICE_SYSTEM if spoken else ASK_SYSTEM, content, 300 if spoken else 600, fast=spoken)
-        return (text or format_find(question, hits)), hits
+        text = strip_refs(await llm.complete(cfg, VOICE_SYSTEM if spoken else ASK_SYSTEM, content,
+                                             300 if spoken else 600, fast=spoken))
+        if re.fullmatch(r"\W*NO_ANSWER\W*", text or "") or not text:
+            if cfg.web_fallback and llm.can_research(cfg):
+                return await web_answer(cfg, question, spoken), []
+            return ("I don't have that yet." if spoken else
+                    "I don't have that in our docs or chats yet."), hits
+        return text, hits
     except Exception:
         log.exception("answer failed")
         if spoken:
             return "I hit an error working that out. The closest matches are in the chat.", hits
         return "I hit an error writing that answer. Closest matches:\n" + format_find(question, hits).split("\n", 1)[-1], hits
+
+
+RESEARCH_SYSTEM = (
+    "You are Rocky, a team's assistant in Discord. Search the web and answer the question with current, accurate "
+    "facts. Be brief: under 120 words unless the question needs more. Give just the answer, no citations like [1], "
+    "no links, no 'according to'. If results disagree, use the most recent reliable source. If you can't find it, "
+    "say so in one sentence. Plain Discord markdown. Do not use hyphens or em dashes; use commas or new sentences."
+)
+RESEARCH_VOICE = (
+    "You are Rocky, answering OUT LOUD in a Discord voice call. Search the web and answer in one to three short "
+    "spoken sentences: plain conversational English, no lists, links, citations or markdown, numbers written the way "
+    "you'd say them. Calm, precise, dry. If you can't find it, say so in one sentence."
+)
+
+
+async def web_answer(cfg: Config, question: str, spoken: bool = False) -> str:
+    """Answer from a live web search."""
+    if not llm.can_research(cfg):
+        return "Web research isn't set up. It needs a Gemini or Anthropic key."
+    try:
+        text = strip_refs(await llm.research(cfg, RESEARCH_VOICE if spoken else RESEARCH_SYSTEM, question,
+                                             300 if spoken else 700, fast=spoken))
+        return text or "I couldn't find that online."
+    except Exception:
+        log.exception("web research failed")
+        return "I couldn't reach the web search just now."

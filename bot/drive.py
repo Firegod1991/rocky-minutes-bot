@@ -47,6 +47,16 @@ MAX_FILES = 3000
 MAX_DEPTH = 12
 
 
+async def _read_all(r, limit: int = MAX_BYTES) -> bytes:
+    """Read a whole response body; StreamReader.read(n) can return just one chunk."""
+    buf = bytearray()
+    async for chunk in r.content.iter_chunked(1 << 16):
+        buf += chunk
+        if len(buf) > limit:
+            raise RuntimeError("file too large")
+    return bytes(buf)
+
+
 def folder_links(text: str) -> list[tuple[str, str]]:
     out, seen = [], set()
     for m in FOLDER_RE.finditer(text or ""):
@@ -238,10 +248,7 @@ class DriveIndexer:
                 body = (await r.text())[:300]
                 raise PermissionError(f"{r.status}: {body}") if r.status in (401, 403, 404) else RuntimeError(f"{r.status}: {body}")
             if raw:
-                data = await r.content.read(MAX_BYTES + 1)
-                if len(data) > MAX_BYTES:
-                    raise RuntimeError("file too large")
-                return data
+                return await _read_all(r)
             return await r.json()
 
     async def _list(self, folder_id: str) -> list[dict]:
@@ -300,23 +307,126 @@ class DriveIndexer:
             return await asyncio.get_running_loop().run_in_executor(None, xlsx_text, data)
         return data.decode("utf-8", errors="replace")
 
+    # public link mode (no credentials) ------------------------------------------
+    # Folders and files shared as "anyone with the link" can be read with no key at all:
+    # the folder's embedded view lists its items, and Docs/Sheets/Slides have public export URLs.
+    async def _public_get(self, url: str, raw: bool = True):
+        s = await self._session()
+        async with s.get(url, headers={"User-Agent": "Mozilla/5.0 (RockyBot)"}, allow_redirects=True) as r:
+            if r.status in (401, 403, 404):
+                raise PermissionError(f"{r.status}")
+            if r.status != 200:
+                raise RuntimeError(f"{r.status}")
+            data = await _read_all(r)
+            ctype = r.headers.get("Content-Type", "")
+            if raw and "text/html" in ctype and b"accounts.google.com" in data[:20000]:
+                raise PermissionError("not shared publicly")
+            return data
+
+    @staticmethod
+    def _public_kind(href: str, name: str) -> tuple[str, str]:
+        """(item id, mime) from an embedded folder view link."""
+        for pat, mime in ((r"/drive/(?:u/\d+/)?folders/([\w-]+)", FOLDER_MIME),
+                          (r"docs\.google\.com/document/d/([\w-]+)", "application/vnd.google-apps.document"),
+                          (r"docs\.google\.com/spreadsheets/d/([\w-]+)", "application/vnd.google-apps.spreadsheet"),
+                          (r"docs\.google\.com/presentation/d/([\w-]+)", "application/vnd.google-apps.presentation"),
+                          (r"/file/d/([\w-]+)", "")):
+            m = re.search(pat, href)
+            if m:
+                if not mime:
+                    low = name.lower()
+                    mime = ("application/pdf" if low.endswith(".pdf") else
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document" if low.endswith(".docx") else
+                            XLSX if low.endswith(".xlsx") else
+                            "text/csv" if low.endswith(".csv") else
+                            "text/plain" if low.endswith((".txt", ".md")) else "")
+                return m.group(1), mime
+        return "", ""
+
+    async def _public_list(self, folder_id: str) -> tuple[str, list[tuple[str, str, str, str]]]:
+        """(folder name, [(id, name, mime, url)]) for a public folder."""
+        import html as _html
+
+        data = await self._public_get(f"https://drive.google.com/embeddedfolderview?id={folder_id}", raw=False)
+        page = data.decode("utf-8", "replace")
+        t = re.search(r"<title>(.*?)</title>", page, re.S)
+        name = _html.unescape(t.group(1).strip()) if t else "Shared folder"
+        items = []
+        for href, title in re.findall(
+                r'<div class="flip-entry" id="entry-[\w-]+".*?<a href="([^"]+)".*?<div class="flip-entry-title">(.*?)</div>',
+                page, re.S):
+            href, title = _html.unescape(href), _html.unescape(re.sub(r"<[^>]+>", "", title)).strip()
+            iid, mime = self._public_kind(href, title)
+            if iid:
+                items.append((iid, title, mime, href))
+        if not items and "flip-entry" not in page and "accounts.google.com" in page:
+            raise PermissionError("folder is not shared as anyone with the link")
+        return name, items
+
+    async def walk_public(self, root_id: str) -> tuple[str, list[DriveFile]]:
+        root_name, _ = await self._public_list(root_id)
+        # public pages carry no modified time: re-read each refresh period instead
+        stamp = f"public:{int(time.time() // max(self.refresh_hours * 3600, 3600))}"
+        out: list[DriveFile] = []
+        queue, seen = [(root_id, root_name, 0)], {root_id}
+        while queue and len(out) < MAX_FILES:
+            fid, path, depth = queue.pop(0)
+            try:
+                _, items = await self._public_list(fid)
+            except PermissionError:
+                log.info("drive: subfolder %s (%s) is not public, skipped", path, fid)
+                continue
+            for iid, name, mime, href in items:
+                if mime == FOLDER_MIME:
+                    if depth < MAX_DEPTH and iid not in seen:
+                        seen.add(iid)
+                        queue.append((iid, f"{path} / {name}", depth + 1))
+                elif mime:
+                    out.append(DriveFile(iid, name, mime, stamp, href, path))
+            await asyncio.sleep(0.2)
+        return root_name, out
+
+    async def read_public(self, f: DriveFile) -> str:
+        if f.mime == "application/vnd.google-apps.document":
+            data = await self._public_get(f"https://docs.google.com/document/d/{f.id}/export?format=txt")
+            return data.decode("utf-8", "replace").lstrip("﻿")
+        if f.mime == "application/vnd.google-apps.spreadsheet":
+            data = await self._public_get(f"https://docs.google.com/spreadsheets/d/{f.id}/export?format=xlsx")
+            return await asyncio.get_running_loop().run_in_executor(None, xlsx_text, data)
+        if f.mime == "application/vnd.google-apps.presentation":
+            data = await self._public_get(f"https://docs.google.com/presentation/d/{f.id}/export/txt")
+            return data.decode("utf-8", "replace").lstrip("﻿")
+        data = await self._public_get(f"https://drive.google.com/uc?export=download&id={f.id}")
+        if f.mime == "application/pdf":
+            return await asyncio.get_running_loop().run_in_executor(None, pdf_text, data)
+        if f.mime.endswith("wordprocessingml.document"):
+            return docx_text(data)
+        if f.mime == XLSX:
+            return await asyncio.get_running_loop().run_in_executor(None, xlsx_text, data)
+        return data.decode("utf-8", errors="replace")
+
     # crawl --------------------------------------------------------------------
     async def crawl(self, folder: dict, force: bool = False) -> str:
         fid, guild_id = folder["folder_id"], folder["guild_id"]
         if fid in self._busy:
             return "busy"
-        if not self.auth.mode:
-            self._set_folder(fid, status="no_credentials")
-            return "no_credentials"
         self._busy.add(fid)
         try:
-            try:
-                root_name, files = await self.walk(fid)
-            except PermissionError as e:
-                log.warning("drive folder %s not readable: %s", fid, e)
-                self._set_folder(fid, status="no_access", last_crawl=time.time())
-                return "no_access"
-            ok, skipped, failed = await self._index_files(fid, guild_id, files, force)
+            files, root_name, reader = None, None, self.read
+            if self.auth.mode:
+                try:
+                    root_name, files = await self.walk(fid)
+                except PermissionError as e:
+                    log.info("drive folder %s not readable with credentials (%s); trying public link", fid, str(e)[:80])
+            if files is None:
+                try:
+                    root_name, files = await self.walk_public(fid)
+                    reader = self.read_public
+                except PermissionError as e:
+                    log.warning("drive folder %s not readable: %s", fid, e)
+                    self._set_folder(fid, status="no_access", last_crawl=time.time())
+                    return "no_access"
+            ok, skipped, failed = await self._index_files(fid, guild_id, files, force, reader)
             self._set_folder(fid, status="ok", name=root_name, files=len(files), last_crawl=time.time())
             log.info("drive folder %r: %d files (%d updated, %d unchanged, %d unreadable)",
                      root_name, len(files), ok, skipped, failed)
@@ -324,20 +434,23 @@ class DriveIndexer:
         finally:
             self._busy.discard(fid)
 
-    async def _index_files(self, fid: str, guild_id: int, files: list[DriveFile], force: bool = False) -> tuple[int, int, int]:
+    async def _index_files(self, fid: str, guild_id: int, files: list[DriveFile], force: bool = False,
+                           reader=None) -> tuple[int, int, int]:
         """Index changed files under a folder key, drop files that disappeared. Returns (updated, unchanged, failed)."""
         with self.kb._lock:
-            known = dict(self.db.execute("SELECT file_id, modified FROM drive_files WHERE folder_id = ?", (fid,)).fetchall())
+            rows = self.db.execute("SELECT file_id, modified, status FROM drive_files WHERE folder_id = ?", (fid,)).fetchall()
+        known = {r[0]: r[1] for r in rows}
+        retry = {r[0] for r in rows if r[2] == "error"}  # unreadable last time: try again
         ok = skipped = failed = 0
         current = set()
         for f in files:
             current.add(f.id)
-            if not force and known.get(f.id) == f.modified:
+            if not force and f.id not in retry and known.get(f.id) == f.modified:
                 skipped += 1
                 continue
             label = EXPORTS.get(f.mime, (None, DOWNLOADS.get(f.mime, "File")))[1]
             try:
-                text = await self.read(f)
+                text = await (reader or self.read)(f)
                 status = "ok" if text.strip() else "empty"
             except Exception as e:
                 log.info("drive file %s (%s) unreadable: %s", f.name, f.id, str(e)[:120])

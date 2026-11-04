@@ -60,9 +60,7 @@ class Indexer:
             return
         # questions addressed to a bot ("@Rocky ...") are not knowledge
         lead = (m.content or "").lstrip()
-        if lead.startswith("<@") and (any(u.bot for u in m.mentions) or any(r.managed for r in m.role_mentions)):
-            self.kb.delete(message_key(m))
-            return
+        addressed = lead.startswith("<@") and (any(u.bot for u in m.mentions) or any(r.managed for r in m.role_mentions))
         parts = [m.content or ""]
         for a in m.attachments:
             parts.append(f"[attachment: {a.filename}] {a.url}")
@@ -74,8 +72,12 @@ class Indexer:
         kind = "minutes" if (is_minutes and m.author.bot) else "msg"
         label = _channel_label(m.channel)
         author = getattr(m.author, "display_name", None) or m.author.name
-        self.kb.upsert(message_key(m), kind, m.guild.id, label, author, m.jump_url,
-                       (m.content or "")[:80], body, m.created_at.timestamp())
+        if addressed:
+            # a question to Rocky is not knowledge, but any file it links still gets read
+            self.kb.delete(message_key(m))
+        else:
+            self.kb.upsert(message_key(m), kind, m.guild.id, label, author, m.jump_url,
+                           (m.content or "")[:80], body, m.created_at.timestamp())
         if self.drive is not None:
             for folder_id, url in folder_links(body):
                 if self.drive.add_folder(folder_id, m.guild.id, url, author):
@@ -86,38 +88,56 @@ class Indexer:
             self.kb.note_file(gkind, fid, url, m.guild.id, label, author, m.content or "", m.created_at.timestamp())
             self.queue.put_nowait(fid)
         for a in m.attachments:
-            if a.filename.lower().endswith((".txt", ".md", ".csv")) and a.size < 2_000_000:
+            if a.filename.lower().endswith((".txt", ".md", ".csv", ".pdf", ".docx", ".xlsx", ".pptx")) and a.size < 25_000_000:
                 self.queue.put_nowait(("attachment", a.url, a.filename, m))
 
+    async def _read_history(self, ch, limit: int, minutes_channel_id: Optional[int]) -> int:
+        n = 0
+        try:
+            # some channels make Discord's history call hang; never let one block the rest
+            async with asyncio.timeout(90):
+                async for m in ch.history(limit=limit, oldest_first=False):
+                    self.index_message(m, minutes_channel_id)
+                    n += 1
+        except (discord.Forbidden, discord.NotFound):
+            pass
+        except TimeoutError:
+            log.warning("backfill timed out for #%s after %d messages", getattr(ch, "name", ch), n)
+        except Exception:
+            log.warning("backfill failed for #%s", getattr(ch, "name", ch), exc_info=True)
+        return n
+
     async def backfill(self, guild: discord.Guild, minutes_channel_id: Optional[int]) -> None:
+        """Read every channel Rocky can see: text, voice, stage, forum posts and threads (open and archived)."""
         limit = self.cfg.index_history_limit
-        channels = [c for c in guild.text_channels] + [c for c in guild.voice_channels]
+        channels = list(guild.text_channels) + list(guild.voice_channels) + list(getattr(guild, "stage_channels", []))
+        forums = list(getattr(guild, "forums", []))
         total = 0
-        for ch in channels:
+        threads: dict[int, object] = {}
+        try:
+            for th in await guild.active_threads():
+                threads[th.id] = th
+        except Exception:
+            log.debug("active_threads failed", exc_info=True)
+        for ch in channels + forums:
             perms = ch.permissions_for(guild.me)
             if not (perms.view_channel and perms.read_message_history):
                 continue
-            n = 0
-            try:
-                # some channels make Discord's history call hang; never let one block the rest
-                async with asyncio.timeout(60):
-                    async for m in ch.history(limit=limit, oldest_first=False):
-                        self.index_message(m, minutes_channel_id)
-                        n += 1
-                    # active threads under text channels
-                    for th in getattr(ch, "threads", []):
-                        async for m in th.history(limit=limit):
-                            self.index_message(m, minutes_channel_id)
-                            n += 1
-            except discord.Forbidden:
-                continue
-            except TimeoutError:
-                log.warning("backfill timed out for #%s after %d messages; skipping", ch.name, n)
-            except Exception:
-                log.warning("backfill failed for #%s", ch.name, exc_info=True)
-            total += n
+            if ch not in forums:
+                total += await self._read_history(ch, limit, minutes_channel_id)
+            for th in getattr(ch, "threads", []):
+                threads[th.id] = th
+            if hasattr(ch, "archived_threads"):
+                try:
+                    async with asyncio.timeout(30):
+                        async for th in ch.archived_threads(limit=100):
+                            threads[th.id] = th
+                except Exception:
+                    pass
             await asyncio.sleep(0)
-        log.info("indexed %d messages from %s (%s)", total, guild.name, self.kb.count())
+        for th in threads.values():
+            total += await self._read_history(th, limit, minutes_channel_id)
+        log.info("indexed %d messages from %s (%d threads) (%s)", total, guild.name, len(threads), self.kb.count())
         self.backfill_done.set()
 
     # meetings -------------------------------------------------------------
@@ -150,10 +170,12 @@ class Indexer:
         if not rows:
             return
         f = rows[0]
-        status, text = await fetch_google_file(self._http, f["kind"], file_id)
+        status, text, real_title = await fetch_google_file(self._http, f["kind"], file_id)
         label = KIND_LABEL.get(f["kind"], "Google file")
+        if status == "ok" and not text.strip():
+            status = "unreadable"  # images, videos and other files with no text
         if status == "ok":
-            title = title_from_text(f["kind"], text, f["context"])
+            title = real_title or title_from_text(f["kind"], text, f["context"])
             self.kb.upsert(f"gdoc:{file_id}", "gdoc", f["guild_id"], f["channel"], f["author"], f["url"],
                            f"{label}: {title}", text, f["ts"])
             self.kb.mark_file(file_id, "ok", title)
@@ -171,7 +193,13 @@ class Indexer:
         async with self._http.get(url) as r:
             if r.status != 200:
                 return
-            text = (await r.read())[:2_000_000].decode("utf-8", errors="replace")
+            from .drive import _read_all
+            from .knowledge import file_to_text
+            data = await _read_all(r)
+            text = await asyncio.get_running_loop().run_in_executor(
+                None, file_to_text, filename, r.headers.get("content-type", ""), data)
+        if not text.strip():
+            return
         label = _channel_label(m.channel)
         self.kb.upsert(f"file:{m.id}:{filename}", "file", m.guild.id, label,
                        getattr(m.author, "display_name", m.author.name), m.jump_url, filename, text,

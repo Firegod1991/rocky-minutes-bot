@@ -197,3 +197,50 @@ def test_speakable_strips_chat_formatting():
     from bot.speech import speakable
     s = speakable("The **total weight** is 155 kg [1], margin 12 kg. <https://docs.google.com/x> [doc](https://x.y) <@123>")
     assert s == "The total weight is 155 kg, margin 12 kg. doc someone"
+
+
+def test_drive_file_links_and_file_text():
+    import io
+    import zipfile
+    from bot.knowledge import _disposition_name, file_to_text
+    t = "spec https://drive.google.com/file/d/1PdfPdfPdfPdfPdfPdfPdfPdf0/view?usp=sharing and https://drive.google.com/open?id=1OpenOpenOpenOpenOpenOpen"
+    assert [(k, i[:5]) for k, i, _ in google_links(t)] == [("file", "1PdfP"), ("file", "1Open")]
+    assert _disposition_name("attachment; filename=\"x.txt\"; filename*=UTF-8''Rover%20Mass%20Budget.xlsx") == "Rover Mass Budget.xlsx"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("ppt/slides/slide1.xml", "<p:sld><a:t>Rover</a:t><a:t>194 kg</a:t></p:sld>")
+    assert file_to_text("deck.pptx", "", buf.getvalue()) == "Slide 1: Rover 194 kg"
+    assert file_to_text("a.png", "image/png", b"\x89PNG") == ""
+    assert file_to_text("n.txt", "text/plain", "﻿hello".encode()) == "hello"
+
+
+def test_research_commands():
+    from bot.assistant import parse_command
+    for t, q in [("research the Mars 2020 rover mass", "the Mars 2020 rover mass"),
+                 ("can you look up the price of a Raspberry Pi 5 online", "the price of a Raspberry Pi 5"),
+                 ("search the web for NASA L'SPACE deadlines", "NASA L'SPACE deadlines"),
+                 ("google lunar regolith density", "lunar regolith density")]:
+        c = parse_command(t)
+        assert (c.kind, c.arg) == ("research", q), t
+    assert parse_command("pull up the risk log").kind == "find"
+    assert parse_command("what's the weight of the rover").kind == "ask"
+    assert parse_command("are we meeting online tomorrow").kind == "ask"
+
+
+def test_no_answer_falls_back_to_web(tmp_path, monkeypatch):
+    import asyncio
+    from bot import assistant, llm
+    from bot.config import Config
+    from bot.knowledge import KnowledgeBase
+    cfg = Config()
+    cfg.gemini_api_key, cfg.anthropic_api_key, cfg.ollama_url = "k", "", ""
+    async def fake_complete(*a, **k): return "NO_ANSWER"
+    async def fake_research(cfg, system, q, *a, **k): return f"web says {q} [1]"
+    monkeypatch.setattr(llm, "complete", fake_complete)
+    monkeypatch.setattr(llm, "research", fake_research)
+    kb = KnowledgeBase(tmp_path / "kb.db")
+    text, _ = asyncio.run(assistant.answer_with_hits(cfg, kb, 1, "speed of light", "fire"))
+    assert text == "web says speed of light"
+    cfg.web_fallback = False
+    text, _ = asyncio.run(assistant.answer_with_hits(cfg, kb, 1, "speed of light", "fire"))
+    assert "don't have that" in text

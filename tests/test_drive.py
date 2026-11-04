@@ -105,7 +105,11 @@ def test_no_access_and_no_credentials(tmp_path):
     assert asyncio.run(d.crawl(d.folders(1)[0])) == "no_access"
     nocreds = DriveIndexer(kb, DriveAuth(Path("/nonexistent"), api_key=""))
     nocreds.add_folder("other", 1, "u", "fire")
-    assert asyncio.run(nocreds.crawl([f for f in nocreds.folders(1) if f["folder_id"] == "other"][0])) == "no_credentials"
+
+    async def not_public(url, raw=True):
+        raise PermissionError("not shared publicly")
+    nocreds._public_get = not_public  # no key: falls back to the public link, which is private here
+    assert asyncio.run(nocreds.crawl([f for f in nocreds.folders(1) if f["folder_id"] == "other"][0])) == "no_access"
 
 
 def test_docx_text():
@@ -134,7 +138,7 @@ def test_hybrid_search_finds_by_meaning(tmp_path):
 
     kb = KnowledgeBase(tmp_path / "kb.db")
     kb.upsert("gdrive:parts", "gdoc", 1, "Drive: Shared with Rocky", "Google Drive", "https://x/parts",
-              "Google Sheet: Rover Parts List", "[Totals] Section: Mobility; Total mass (kg): 25", 0)
+              "Google Sheet: Parts List", "[Totals] Section: Mobility; Total mass (kg): 25", 0)
     kb.upsert("msg:1", "msg", 1, "general", "fire", "https://x/m", "hi", "lunch at noon tomorrow", 0)
 
     class FakeEmb:
@@ -151,3 +155,26 @@ def test_hybrid_search_finds_by_meaning(tmp_path):
     kb.delete("gdrive:parts")
     with kb._lock:
         assert kb.db.execute("SELECT count(*) FROM vecs").fetchone()[0] == 1  # vector removed with its chunk
+
+
+def test_public_folder_listing_parse(tmp_path):
+    import asyncio
+    from bot.drive import DriveIndexer, DriveAuth, FOLDER_MIME
+    from bot.knowledge import KnowledgeBase
+    page = ('<html><title>MCA Team 2 F26</title>'
+            '<div class="flip-entry" id="entry-AAA111bbb22"><a href="https://drive.google.com/drive/folders/AAA111bbb22">'
+            '<div class="flip-entry-title">Deliverables</div></a></div>'
+            '<div class="flip-entry" id="entry-SHEET1234567"><a href="https://docs.google.com/spreadsheets/d/SHEET1234567/edit?usp=drive_web">'
+            '<div class="flip-entry-title">Parts &amp; Mass</div></a></div>'
+            '<div class="flip-entry" id="entry-PDF12345678"><a href="https://drive.google.com/file/d/PDF12345678/view?usp=drive_web">'
+            '<div class="flip-entry-title">Report.pdf</div></a></div></html>')
+    d = DriveIndexer(KnowledgeBase(tmp_path / "kb.db"), DriveAuth(tmp_path / "none.json"))
+
+    async def fake_get(url, raw=True):
+        return page.encode()
+    d._public_get = fake_get
+    name, items = asyncio.run(d._public_list("root"))
+    assert name == "MCA Team 2 F26"
+    assert [(i[1], i[2]) for i in items] == [("Deliverables", FOLDER_MIME),
+                                             ("Parts & Mass", "application/vnd.google-apps.spreadsheet"),
+                                             ("Report.pdf", "application/pdf")]

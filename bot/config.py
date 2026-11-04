@@ -102,6 +102,13 @@ class Config:
     google_api_key: str = field(default_factory=lambda: os.getenv("GOOGLE_API_KEY", ""))
     index_history_limit: int = field(default_factory=lambda: _int("INDEX_HISTORY_LIMIT", 2000))
     doc_refresh_hours: int = field(default_factory=lambda: _int("DOC_REFRESH_HOURS", 6))
+    # Web research: "Rocky, research ..." searches the internet (Gemini with Google Search, or Claude web search)
+    web_research: bool = field(default_factory=lambda: _bool("WEB_RESEARCH", True))
+    # when the team's own docs and chats don't have the answer, look it up online instead
+    web_fallback: bool = field(default_factory=lambda: _bool("WEB_FALLBACK", True))
+    # optional search APIs used when Google Search grounding isn't available (Wikipedia is the free default)
+    brave_api_key: str = field(default_factory=lambda: os.getenv("BRAVE_API_KEY", ""))
+    tavily_api_key: str = field(default_factory=lambda: os.getenv("TAVILY_API_KEY", ""))
 
     def validate(self) -> None:
         if not self.all_tokens:

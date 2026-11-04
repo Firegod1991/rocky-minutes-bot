@@ -25,10 +25,12 @@ GOOGLE_RE = re.compile(
 DRIVE_RE = re.compile(r"https?://drive\.google\.com/(?:file/d/|open\?id=)(?P<id>[A-Za-z0-9_-]{20,})[^\s<>)\]]*")
 EXPORT_URL = {
     "document": "https://docs.google.com/document/d/{id}/export?format=txt",
-    "spreadsheets": "https://docs.google.com/spreadsheets/d/{id}/export?format=csv",
+    "spreadsheets": "https://docs.google.com/spreadsheets/d/{id}/export?format=xlsx",
     "presentation": "https://docs.google.com/presentation/d/{id}/export/txt",
+    "file": "https://drive.google.com/uc?export=download&id={id}",
 }
-KIND_LABEL = {"document": "Google Doc", "spreadsheets": "Google Sheet", "presentation": "Google Slides"}
+KIND_LABEL = {"document": "Google Doc", "spreadsheets": "Google Sheet", "presentation": "Google Slides",
+              "file": "Drive file"}
 
 CHUNK_CHARS = 1500
 STOPWORDS = set(
@@ -65,6 +67,10 @@ def google_links(text: str) -> list[tuple[str, str, str]]:
         if m.group("id") not in seen:
             seen.add(m.group("id"))
             out.append((m.group("kind"), m.group("id"), m.group(0)))
+    for m in DRIVE_RE.finditer(text or ""):
+        if m.group("id") not in seen:
+            seen.add(m.group("id"))
+            out.append(("file", m.group("id"), m.group(0)))
     return out
 
 
@@ -244,37 +250,100 @@ class KnowledgeBase:
         return hits[:limit]
 
 
-async def fetch_google_file(session, kind: str, file_id: str, timeout: float = 30) -> tuple[str, str]:
-    """Returns (status, text). status is ok | private | missing | error."""
+def _disposition_name(header: str) -> str:
+    """File name from a Content-Disposition header (Google puts the real title there)."""
+    from urllib.parse import unquote
+
+    m = re.search(r"filename\*=UTF-8''([^;]+)", header or "", re.I)
+    if m:
+        return unquote(m.group(1)).strip('"')
+    m = re.search(r'filename="?([^";]+)"?', header or "", re.I)
+    return m.group(1) if m else ""
+
+
+def file_to_text(name: str, ctype: str, data: bytes) -> str:
+    """Text from a downloaded file: Google export, pdf, docx, xlsx, pptx or plain text."""
+    from .drive import docx_text, pdf_text, xlsx_text
+
+    low, ctype = (name or "").lower(), (ctype or "").lower()
+    if data[:4] == b"%PDF" or low.endswith(".pdf"):
+        return pdf_text(data)
+    if data[:2] == b"PK":
+        import io as _io
+        import zipfile
+
+        names = zipfile.ZipFile(_io.BytesIO(data)).namelist()
+        if "word/document.xml" in names:
+            return docx_text(data)
+        if any(n.startswith("xl/") for n in names):
+            return xlsx_text(data)
+        if any(n.startswith("ppt/slides/") for n in names):
+            return pptx_text(data)
+        return ""
+    if any(t in ctype for t in ("image/", "video/", "audio/", "octet-stream")) and not low.endswith((".txt", ".md", ".csv", ".json")):
+        return ""
+    return data.decode("utf-8", errors="replace").lstrip("\ufeff")
+
+
+def pptx_text(data: bytes) -> str:
+    import io as _io
+    import zipfile
+
+    out = []
+    with zipfile.ZipFile(_io.BytesIO(data)) as z:
+        slides = sorted((n for n in z.namelist() if re.match(r"ppt/slides/slide\d+\.xml$", n)),
+                        key=lambda n: int(re.findall(r"\d+", n)[-1]))
+        for i, n in enumerate(slides, 1):
+            words = re.findall(r"<a:t>([^<]*)</a:t>", z.read(n).decode("utf-8", "replace"))
+            if words:
+                out.append(f"Slide {i}: " + " ".join(words))
+    return "\n".join(out)
+
+
+async def fetch_google_file(session, kind: str, file_id: str, timeout: float = 60) -> tuple[str, str, str]:
+    """Returns (status, text, real file title). status is ok | private | missing | error."""
     import aiohttp
 
-    url = EXPORT_URL[kind].format(id=file_id)
+    from .drive import _read_all
+
+    url = EXPORT_URL.get(kind, EXPORT_URL["file"]).format(id=file_id)
     try:
-        async with session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+        async with session.get(url, allow_redirects=True, headers={"User-Agent": "Mozilla/5.0 (RockyBot)"},
+                               timeout=aiohttp.ClientTimeout(total=timeout)) as r:
             final = str(r.url)
             if "accounts.google.com" in final or "ServiceLogin" in final or r.status in (401, 403):
-                return "private", ""
+                return "private", "", ""
             if r.status == 404:
-                return "missing", ""
+                return "missing", "", ""
             if r.status != 200:
-                return "error", ""
+                return "error", "", ""
             ctype = r.headers.get("content-type", "")
-            if "text/html" in ctype:
-                return "private", ""
-            raw = await r.read()
-            return "ok", raw[:2_000_000].decode("utf-8", errors="replace").lstrip("﻿")
+            name = _disposition_name(r.headers.get("content-disposition", ""))
+            data = await _read_all(r)
+        if "text/html" in ctype:
+            # big Drive files show a "can't scan for viruses" page first; follow its confirm link once
+            page = data.decode("utf-8", "replace")
+            if kind == "file" and ("uc-download-link" in page or "confirm" in page) and "accounts.google.com" not in page:
+                async with session.get(f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t",
+                                       timeout=aiohttp.ClientTimeout(total=timeout)) as r2:
+                    if r2.status != 200 or "text/html" in r2.headers.get("content-type", ""):
+                        return "private", "", ""
+                    ctype = r2.headers.get("content-type", "")
+                    name = _disposition_name(r2.headers.get("content-disposition", "")) or name
+                    data = await _read_all(r2)
+            else:
+                return "private", "", ""
+        title = re.sub(r"\.(txt|xlsx|csv|docx|pdf|pptx|md)$", "", name, flags=re.I).strip()
+        text = await asyncio.get_running_loop().run_in_executor(None, file_to_text, name, ctype, data)
+        return "ok", text, title
     except asyncio.TimeoutError:
-        return "error", ""
+        return "error", "", ""
     except Exception:
         log.warning("fetch failed for %s %s", kind, file_id, exc_info=True)
-        return "error", ""
+        return "error", "", ""
 
 
 def title_from_text(kind: str, text: str, context: str) -> str:
-    if kind == "spreadsheets":
-        first = text.splitlines()[0] if text else ""
-        if first:
-            return f"Sheet ({first[:60]})"
     for line in (text or "").splitlines():
         line = line.strip(" \t​#*")
         if 3 <= len(line) <= 120:

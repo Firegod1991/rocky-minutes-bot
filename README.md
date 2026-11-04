@@ -1,49 +1,94 @@
-# Rocky: Discord Meeting Minutes Bot
+# Rocky: a Discord meeting assistant
 
-Joins a voice channel when people show up, records each speaker on their own track, transcribes locally with Whisper, asks Claude for minutes, and posts everything to a dedicated `#meeting-minutes` channel a couple of minutes after the meeting ends. Transcript and minutes are attached as `.txt` files, organized by username and timestamp, and the transcript is also posted in a thread under the minutes.
+Rocky sits in your Discord server, records voice meetings, writes the minutes, and answers questions about your team's work out loud or in chat. It reads the Google Docs, Sheets, Slides and Drive folders your team posts and answers from the latest data, with no file paths or citations in the way.
+
+Transcription and voice run on your own machine. Only the text of a question (or a finished transcript) goes to the language model you pick, and you can run that locally too with Ollama.
 
 ## What it does
 
-1. Someone joins a voice channel. The bot joins too and starts recording (configurable minimum participant count, allow/deny lists, AFK channel ignored).
-2. Each speaker is recorded separately and aligned on one timeline, so the transcript reads `[00:04:12] fire: ...` / `[00:04:20] tyler: ...` in the real order.
-3. When the channel empties (30 s grace by default) the bot leaves, waits `PUBLISH_DELAY_SECONDS` (2 min default), transcribes with faster whisper on your own CPU/GPU, and sends the transcript to Claude for Summary, Key Points, Decisions, Action Items, Open Questions.
-4. The result lands in `#meeting-minutes` (created automatically, read only for members) with `..._minutes.txt` and `..._transcript.txt` attached, plus the full transcript in a thread under the post. Talk time per person is included.
-5. Meetings shorter than `MIN_MEETING_SECONDS` are discarded. Sessions interrupted by a restart are picked up and processed on the next boot.
+**Meeting minutes**
+* Joins a voice channel when people show up and records each speaker on their own track
+* Transcribes locally with faster whisper, in the real order of who said what
+* Posts a summary, key points, decisions, action items and open questions to `#meeting-minutes` a couple of minutes after the call ends, with the full transcript as a `.txt` file and in a thread
+* Several bot accounts can run at once, so overlapping meetings in different channels are all covered
 
-Covering every voice channel: Discord lets one bot account be in one voice channel per server at a time. For overlapping meetings, create a second bot application, invite it with the same permissions, and put its token in `DISCORD_EXTRA_TOKENS`. The accounts run in one process and split channels between themselves automatically.
+**Voice and text assistant**
+* Say "Rocky, what's the weight of the rover?" in a call and it answers out loud in a natural voice (Kokoro TTS)
+* Or type `@Rocky what's the weight of the rover?` or `/ask` in any channel
+* `Rocky, action item: Sam sends the budget by Friday` adds it to this meeting's notes
+* `Rocky, take notes now` posts notes so far; `Rocky, stop recording` ends the meeting
+* `@Rocky docs` lists every file it can read; `@Rocky pull up the risk log` posts the link
+* `Rocky, research how much the Perseverance rover weighs` looks it up on the web
 
-Slash commands (Manage Server permission): `/minutes start`, `/minutes stop [now]`, `/minutes status`, `/minutes channel #target`.
+**Knowledge it uses**
+* Every message in every channel, thread and forum post it can see
+* Every Google Doc, Sheet (all tabs), Slides deck and Drive file (PDF, Word, Excel, PowerPoint) linked in any channel
+* Whole Drive folders: post a folder link once and it crawls every file inside, including subfolders
+* Files attached in Discord (PDF, Word, Excel, PowerPoint, txt, md, csv)
+* Past meeting transcripts and minutes
+* Keyword search plus meaning based search, so "how heavy is it" finds a sheet column called "Total mass (kg)"
+* When sources disagree it uses the most recent value
 
-## Discord setup
+Rocky only ever reads Google files. It never edits them.
 
-1. https://discord.com/developers/applications, New Application, Bot.
-2. Bot tab: copy the token. Under Privileged Gateway Intents enable **Server Members Intent**.
-3. OAuth2 URL Generator: scopes `bot` + `applications.commands`. Permissions: View Channels, Connect, Send Messages, Attach Files, Create Public Threads, Send Messages in Threads, Manage Channels (permissions integer 309238811664).
-4. Open the generated URL and add the bot to your server.
-5. Put your server ID in `GUILD_IDS` so slash commands show up instantly.
+**Web research**
+* Say or type `research ...`, `google ...`, `search the web for ...` or `look up ... online`
+* When your own docs and chats don't have the answer, Rocky looks it up online instead (turn off with `WEB_FALLBACK=false`)
+* Search source, best first: Gemini with Google Search (needs billing on your AI Studio project), Claude web search, Brave or Tavily (free keys), then Wikipedia (free, no key)
 
-## Run with Docker
+## Quick start (Docker)
 
 ```bash
-cp .env.example .env     # fill in DISCORD_TOKEN and ANTHROPIC_API_KEY
+git clone https://github.com/Firegod1991/rocky-discord-bot.git
+cd rocky-discord-bot
+cp .env.example .env        # then fill in your own values
+mkdir -p data
 docker compose up -d --build
 docker compose logs -f
 ```
 
-The image downloads the Whisper model at build time (`WHISPER_MODEL`, default `small`). Recordings, transcripts and minutes persist in `./data/sessions/<timestamp>-<guild>-<channel>/`.
+On Linux, run `sudo chown 10001 data` once (the container runs as uid 10001). The first build downloads the Whisper and voice models, so give it a few minutes.
 
-On Linux hosts the container runs as uid 10001, so `mkdir -p data && sudo chown 10001 data` first. Docker Desktop on Windows and macOS handles this for you.
+## Discord setup
 
-## Run without Docker
+1. Go to https://discord.com/developers/applications, create a New Application, then open the Bot tab.
+2. Reset and copy the token into `DISCORD_TOKEN` in your `.env`. Treat it like a password.
+3. Under Privileged Gateway Intents turn on **Server Members Intent** and **Message Content Intent**.
+4. OAuth2, URL Generator: scopes `bot` and `applications.commands`. Permissions: View Channels, Read Message History, Send Messages, Attach Files, Create Public Threads, Send Messages in Threads, Connect, Speak, Manage Channels (only needed to create `#meeting-minutes`).
+5. Open the generated link and add the bot to your server.
+6. Right click your server, Copy Server ID, and put it in `GUILD_IDS`.
+
+**More than one meeting at a time:** Discord allows one voice channel per bot account per server. Create a second application the same way, invite it, and add its token to `DISCORD_EXTRA_TOKENS` (comma separated). The accounts split channels automatically.
+
+**Bot avatar:** drop your own image at `bot/assets/rocky-avatar.png` and each account uses it if it has no avatar yet.
+
+## Language model
+
+Set at least one of these in `.env`:
+
+| Option | Setting | Notes |
+|---|---|---|
+| Google Gemini | `GEMINI_API_KEY` | Free tier at https://aistudio.google.com/apikey. Falls back to the lite model when rate limited |
+| Anthropic Claude | `ANTHROPIC_API_KEY` | Optional |
+| Ollama (local, free) | `OLLAMA_URL`, `OLLAMA_MODEL` | Runs on your machine. Also used for embeddings: `ollama pull nomic-embed-text` |
+
+Rocky tries them in that order and falls back automatically.
+
+## Google Docs and Drive
+
+* **Linked files:** share each file as "Anyone with the link can view" and post the link in any channel. No key needed.
+* **Public folders:** post the folder link. No key needed. Rocky reads everything inside and re reads every `DOC_REFRESH_HOURS`.
+* **Private folders:** create a Google Cloud service account, save its JSON key as `data/google-service-account.json`, and share the folder with the service account email as Viewer.
+
+## Running without Docker
 
 ```bash
+sudo apt install libopus0 git espeak-ng
 python3.12 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env && set -a && . ./.env && set +a
 python -m bot.main
 ```
-
-Needs libopus on the host (`apt install libopus0`; on Windows discord.py bundles it).
 
 ## Tests
 
@@ -52,10 +97,40 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-## Why discord.py fork + voice recv instead of py-cord
+## Keeping your secrets safe
 
-Discord now end to end encrypts voice (DAVE). py-cord 2.8.1 ships `start_recording` but its receive pipeline is broken on release. The `zacker150/discord-ext-voice-recv` fork is the maintained Python path that decrypts DAVE audio, so `requirements.txt` pins it to a tested commit along with the discord.py build it needs.
+* All keys and tokens live only in `.env`, which is in `.gitignore`. Never commit it, paste it in an issue, or put it in a screenshot.
+* `data/` holds recordings, transcripts and the knowledge base and is ignored too.
+* If a token ever leaks, reset it right away in the Discord developer portal or Google AI Studio.
 
 ## Privacy and consent
 
-Recording calls has legal implications. The bot announces in the notes channel when a recording starts. Put a notice in your server rules. Audio is deleted after processing unless `KEEP_AUDIO=true`. Transcript text is sent to Anthropic only if `ANTHROPIC_API_KEY` is set; Whisper runs locally.
+Recording calls has legal rules (two party consent states, GDPR, your server's own rules). Rocky announces in the notes channel when a recording starts. Tell your members in the server rules and channel topics. Audio is deleted after processing unless `KEEP_AUDIO=true`.
+
+## Why the discord.py voice fork
+
+Discord now end to end encrypts voice (DAVE). The `discord-ext-voice-recv` fork pinned in `requirements.txt` is the maintained Python path that can receive and decrypt it.
+
+## Layout
+
+```
+bot/
+  main.py        Discord clients, voice events, commands, multi account coordinator
+  recorder.py    per speaker, timeline aligned audio recording
+  transcribe.py  voice activity chunking and faster whisper
+  live.py        live listening for "Rocky, ..." voice commands
+  speech.py      text to speech (Kokoro or Piper) played into the call
+  assistant.py   command parsing, search, answers
+  knowledge.py   SQLite search index, Google file reading, embeddings
+  indexer.py     reads channel history, threads and linked files
+  drive.py       Google Drive folder crawler (public or service account)
+  minutes.py     minutes generation
+  llm.py         Gemini, Claude and Ollama with automatic fallback, web research
+  publisher.py   notes channel and posting
+  config.py      settings from .env
+tests/
+```
+
+## License
+
+MIT. See `LICENSE`.

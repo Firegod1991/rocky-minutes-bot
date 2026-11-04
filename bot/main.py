@@ -15,13 +15,13 @@ import discord
 from discord import app_commands
 from discord.ext import voice_recv
 
-from .assistant import (HELP_TEXT, answer_question, answer_with_hits, embedder_for, format_docs, format_find, parse_command,
-                        parse_wake, source_links, wake_pattern)
+from .assistant import (HELP_TEXT, web_answer, answer_question, answer_with_hits, embedder_for, format_docs, format_find, parse_command,
+                        parse_wake, wake_pattern)
 from .speech import Speaker, speakable
 from .config import Config
 from .drive import DriveAuth, DriveIndexer
 from .indexer import Indexer
-from .knowledge import KnowledgeBase, embed_pending
+from .knowledge import KnowledgeBase, embed_pending, google_links
 from .live import LiveListener, get_live_model
 from .merge import Segment, chunk_text, coalesce, render_transcript
 from .minutes import generate_minutes
@@ -197,6 +197,12 @@ class MinutesBot(discord.Client):
         await super().close()
 
     async def _minutes_channel(self, guild: discord.Guild):
+        # extra accounts may lack access to the notes channel: post through the main Rocky when it's up
+        if not self.primary:
+            main = next((b for b in self.coord.bots if b.primary and b.is_ready()), None)
+            g = main.get_guild(guild.id) if main else None
+            if g is not None:
+                guild = g
         async with self.coord.channel_lock:
             return await get_minutes_channel(self.cfg, self.settings, guild)
 
@@ -597,13 +603,16 @@ class MinutesBot(discord.Client):
             else:
                 speak("I couldn't find anything on that. If it's a Google doc, someone needs to post the link.")
             return await reply(format_find(cmd.arg, hits))
+        if cmd.kind == "research":
+            text = await web_answer(self.cfg, cmd.arg, spoken=say is not None)
+            speak(text)
+            return await reply(text)
         if cmd.kind == "ask":
             so_far = session.live.transcript_so_far() if session and session.live else ""
             if say:
                 text, hits = await answer_with_hits(self.cfg, kb, guild.id, cmd.arg, asker, so_far, spoken=True)
                 speak(text)
-                links = source_links(hits)
-                return await reply(text + (f"\n{links}" if links else ""))
+                return await reply(text)  # just the answer, no source links
             return await reply(await answer_question(self.cfg, kb, guild.id, cmd.arg, asker, so_far))
         if session is None or owner is None:
             return await reply("I'm not recording a meeting you're in right now. Join the voice channel first.")
@@ -713,6 +722,22 @@ class MinutesBot(discord.Client):
             except Exception:
                 log.exception("indexing failed")
             return
+        # "@Rocky <doc link> ..." still teaches Rocky the file; read it before answering
+        links = google_links(message.content or "")
+        if links:
+            try:
+                self.coord.indexer.index_message(message, self.settings.get_channel_id(message.guild.id))
+                async with message.channel.typing():
+                    for _, fid, _ in links[:10]:
+                        await self.coord.indexer._fetch_one(fid, force=True)
+            except Exception:
+                log.exception("reading linked files failed")
+            rest = re.sub(r"<?https?://\S+>?", "", text).strip(" ,.:;!?")
+            if not rest or re.fullmatch(r"(?:please\s+)?(?:read|add|learn|index|save|remember|check out)(?:\s+(?:this|these|it|that|the doc|the docs?|the files?))*", rest, re.I):
+                n = len(links)
+                await message.reply(f"Got it, I read {'that file' if n == 1 else f'those {n} files'}. Ask me anything about it.",
+                                    mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+                return
         owner, session = self._session_for(message.author)
         asker = message.author.display_name
 
@@ -832,9 +857,23 @@ async def _run_all(cfg: Config) -> None:
     coord = Coordinator(cfg)
     bots = [MinutesBot(cfg, coord, i) for i in range(len(cfg.all_tokens))]
     log.info("starting %d bot account(s)", len(bots))
-    tasks = [asyncio.create_task(b.start(tok)) for b, tok in zip(bots, cfg.all_tokens)]
-
     stop = asyncio.Event()
+
+    async def run_one(b: "MinutesBot", tok: str) -> None:
+        """A bad or reset extra token drops just that account; the others keep running."""
+        try:
+            await b.start(tok)
+        except discord.LoginFailure:
+            if b.index == 0:
+                raise  # without the main account nothing works: exit so the container restarts
+            log.error("[bot %d] token rejected by Discord (reset or mistyped); running without this account", b.index)
+            if b in coord.bots:
+                coord.bots.remove(b)
+            await b.close()
+            await stop.wait()  # stay "running" so one bad extra never stops the rest
+
+    tasks = [asyncio.create_task(run_one(b, tok)) for b, tok in zip(bots, cfg.all_tokens)]
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
