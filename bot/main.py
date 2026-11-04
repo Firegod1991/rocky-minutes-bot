@@ -109,13 +109,19 @@ class MinutesBot(discord.Client):
         log.info("[bot %d] logged in as %s (%s); %d guilds", self.index, self.user, self.user.id, len(self.guilds))
         # catch meetings already in progress when the bot starts
         for guild in self.guilds:
-            if guild.id in self.sessions:
-                continue
-            for vc in guild.voice_channels + guild.stage_channels:
-                if (self._eligible(guild, vc) and len(_humans(vc)) >= self.cfg.min_participants
-                        and (guild.id, vc.id) not in self.coord.claims):
-                    self._spawn(self.start_session(vc))
-                    break
+            await self._scan_guild(guild)
+
+    async def _scan_guild(self, guild: discord.Guild) -> None:
+        """Join the busiest eligible voice channel if we are idle in this guild."""
+        if guild.id in self.sessions:
+            return
+        candidates = [
+            vc for vc in guild.voice_channels + guild.stage_channels
+            if self._eligible(guild, vc) and len(_humans(vc)) >= self.cfg.min_participants
+            and (guild.id, vc.id) not in self.coord.claims
+        ]
+        if candidates:
+            await self.start_session(max(candidates, key=lambda c: len(_humans(c))))
 
     async def close(self) -> None:
         log.info("[bot %d] shutting down; finalizing %d active session(s)", self.index, len(self.sessions))
@@ -149,16 +155,20 @@ class MinutesBot(discord.Client):
 
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState) -> None:
         guild = member.guild
+        session = self.sessions.get(guild.id)
         if member.id == self.user.id:
             # we got kicked, moved, or disconnected
-            if after.channel is None and guild.id in self.sessions:
+            if session is None:
+                return
+            if after.channel is None:
                 log.warning("bot removed from voice in %s", guild.name)
                 await self.end_session(guild.id, reason="bot disconnected")
+            elif after.channel.id != session.channel_id:
+                log.info("bot was moved to #%s; following", after.channel.name)
+                self._retarget(session, after.channel)
             return
         if member.bot or before.channel == after.channel:
             return
-
-        session = self.sessions.get(guild.id)
 
         # someone joined a channel
         if after.channel is not None and self._eligible(guild, after.channel):
@@ -169,11 +179,42 @@ class MinutesBot(discord.Client):
             elif session.channel_id == after.channel.id:
                 session.participants.setdefault(member.id, member.display_name)
                 self._cancel_leave(session)
+            else:
+                # the meeting moved rooms: follow it if the room we record is now empty
+                current = guild.get_channel(session.channel_id)
+                if current is None or not _humans(current):
+                    await self._follow(session, after.channel)
+                    return
 
         # someone left the channel we are recording
         if session and before.channel is not None and before.channel.id == session.channel_id:
             if not _humans(before.channel):
                 self._schedule_leave(session)
+
+    def _retarget(self, session: Session, channel) -> None:
+        self.coord.release(session.guild_id, session.channel_id, self)
+        session.channel_id = channel.id
+        session.channel_name = channel.name
+        self.coord.claim(session.guild_id, channel.id, self)
+        self._cancel_leave(session)
+        for m in _humans(channel):
+            session.participants.setdefault(m.id, m.display_name)
+        session.save_meta("recording")
+
+    async def _follow(self, session: Session, channel) -> None:
+        """Move the live recording to another channel without splitting the notes."""
+        guild = channel.guild
+        vc = guild.voice_client
+        if vc is None:
+            return
+        try:
+            log.info("following meeting from #%s to #%s", session.channel_name, channel.name)
+            await vc.move_to(channel)
+            self._retarget(session, channel)
+        except Exception:
+            log.exception("could not follow to #%s; ending session instead", channel.name)
+            await self.end_session(session.guild_id, reason="follow failed")
+            await self.start_session(channel)
 
     def _schedule_leave(self, session: Session) -> None:
         self._cancel_leave(session)
@@ -184,6 +225,8 @@ class MinutesBot(discord.Client):
             ch = guild.get_channel(session.channel_id) if guild else None
             if ch is None or not _humans(ch):
                 await self.end_session(session.guild_id, reason="channel empty")
+                if guild:
+                    await self._scan_guild(guild)
 
         session.leave_task = self._spawn(_wait_then_leave())
 
