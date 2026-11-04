@@ -143,8 +143,20 @@ class MinutesBot(discord.Client):
         self._spawn(self._embed_loop())
         self._spawn(self._resume_unprocessed())
 
+    async def _ensure_avatar(self) -> None:
+        """Give every Rocky account the Rocky logo if it still has Discord's default avatar."""
+        path = Path(__file__).parent / "assets" / "rocky-avatar.png"
+        if self.user.avatar is not None or not path.exists():
+            return
+        try:
+            await self.user.edit(avatar=path.read_bytes())
+            log.info("[bot %d] avatar set to the Rocky logo", self.index)
+        except Exception as e:  # rate limited or not allowed: harmless, try again next start
+            log.warning("[bot %d] could not set avatar: %s", self.index, e)
+
     async def on_ready(self) -> None:
         log.info("[bot %d] logged in as %s (%s); %d guilds", self.index, self.user, self.user.id, len(self.guilds))
+        self._spawn(self._ensure_avatar())
         # catch meetings already in progress when the bot starts
         for guild in self.guilds:
             await self._scan_guild(guild)
