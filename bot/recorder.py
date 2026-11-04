@@ -95,6 +95,7 @@ class TimelineSink(voice_recv.AudioSink):
         self.started_at = datetime.now(timezone.utc)
         self.finished = False
         self.frames = 0
+        self.live = None  # optional LiveListener fed with the same audio
 
     # voice_recv API -----------------------------------------------------
     def wants_opus(self) -> bool:
@@ -126,6 +127,11 @@ class TimelineSink(voice_recv.AudioSink):
 
             mono = downmix(pcm)
             tr.append(mono)
+            if self.live is not None:
+                try:
+                    self.live.feed(uid, tr.name, mono)
+                except Exception:
+                    log.exception("live feed failed")
             if ts is not None:
                 tr.last_ts = int(ts)
                 tr.last_frame = len(pcm) // (2 * SRC_CHANNELS)
@@ -222,6 +228,9 @@ class Session:
     participants: dict[int, str] = field(default_factory=dict)
     leave_task: Any = None
     manual: bool = False
+    action_items: list[dict] = field(default_factory=list)
+    live: Any = None  # LiveListener while recording
+    awaiting: dict[int, float] = field(default_factory=dict)  # user_id -> time they said just "Rocky"
 
     @property
     def duration(self) -> float:
@@ -239,6 +248,7 @@ class Session:
             "duration_seconds": round(self.duration, 1),
             "participants": {str(k): v for k, v in self.participants.items()},
             "manual": self.manual,
+            "action_items": self.action_items,
         }
 
     def save_meta(self, status: str) -> None:

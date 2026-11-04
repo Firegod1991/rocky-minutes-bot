@@ -73,23 +73,36 @@ async def generate_minutes(
     participants: list[str],
     transcript: str,
     segments: list[Segment],
+    logged_items: list[dict] | None = None,
 ) -> tuple[str, str]:
     """Returns (minutes_markdown, mode) where mode is 'claude' or 'fallback'."""
     head = header(title, started, duration_s, participants)
+    logged = logged_items_block(logged_items or [])
     if not transcript.strip():
-        return head + "\nNo speech was detected in this meeting.\n", "fallback"
+        return head + "\nNo speech was detected in this meeting.\n" + (f"\n{logged}" if logged else ""), "fallback"
 
     body = ""
     mode = "fallback"
     if cfg.anthropic_api_key:
         try:
-            body = await _ask_claude(cfg, title, started, duration_s, participants, transcript)
+            extra = f"\n\nAction items logged by voice during the meeting (include them):\n{logged}" if logged else ""
+            body = await _ask_claude(cfg, title, started, duration_s, participants, transcript + extra)
             mode = "claude"
         except Exception:
             log.exception("Claude summarization failed; posting transcript only")
     if not body:
         body = "Automatic summary unavailable. Full transcript attached.\n"
+        if logged:
+            body += f"\n{logged}"
     return f"{head}\n{body.strip()}\n\n{talk_time_block(segments)}", mode
+
+
+def logged_items_block(items: list[dict]) -> str:
+    if not items:
+        return ""
+    lines = [f"• {it.get('text', '').strip()} (logged by {it.get('by', 'someone')} at {fmt_ts(it.get('t', 0))})"
+             for it in items if it.get("text")]
+    return "**Action Items (logged by voice)**\n" + "\n".join(lines) + "\n"
 
 
 async def _ask_claude(cfg, title, started, duration_s, participants, transcript) -> str:

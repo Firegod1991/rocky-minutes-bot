@@ -4,7 +4,7 @@ services:
       context: .
       args:
         WHISPER_MODEL: ${WHISPER_MODEL:-small}
-    container_name: rocky-minutes-bot
+    container_name: minutes-bot
     env_file: .env
     restart: unless-stopped
     # Give the bot time to finish and save an in progress recording on stop.
@@ -16,8 +16,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "6"
-          memory: 6g
+          cpus: "10"
+          memory: 8g
     logging:
       driver: json-file
       options:

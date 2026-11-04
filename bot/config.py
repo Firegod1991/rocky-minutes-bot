@@ -67,6 +67,17 @@ class Config:
     data_dir: Path = field(default_factory=lambda: Path(os.getenv("DATA_DIR", "./data")))
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
 
+    # Assistant: voice commands, @mentions, knowledge base
+    voice_commands: bool = field(default_factory=lambda: _bool("VOICE_COMMANDS", True))
+    text_commands: bool = field(default_factory=lambda: _bool("TEXT_COMMANDS", True))
+    wake_words: list[str] = field(default_factory=lambda: [
+        w.strip().lower() for w in os.getenv("WAKE_WORDS", "rocky").split(",") if w.strip()
+    ])
+    # small fast model for live wake word listening; the big one still does the final notes
+    live_model: str = field(default_factory=lambda: os.getenv("WHISPER_LIVE_MODEL", "base.en"))
+    index_history_limit: int = field(default_factory=lambda: _int("INDEX_HISTORY_LIMIT", 2000))
+    doc_refresh_hours: int = field(default_factory=lambda: _int("DOC_REFRESH_HOURS", 6))
+
     def validate(self) -> None:
         if not self.all_tokens:
             raise SystemExit("DISCORD_TOKEN is required")

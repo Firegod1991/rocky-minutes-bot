@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1 \
     DATA_DIR=/data \
     HF_HOME=/models
 
-# libopus: Discord audio decode. git: pip install from GitHub.
+# libopus: Discord audio decode. git: pip install from GitHub. ffmpeg: not required, PyAV is bundled.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libopus0 git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -16,10 +16,11 @@ RUN pip install -r requirements.txt
 
 COPY bot ./bot
 
-# Pre download the Whisper model so the first meeting is not slow. Override at build time:
+# Pre download the Whisper model so first meeting is not slow. Override at build time:
 #   docker build --build-arg WHISPER_MODEL=medium .
 ARG WHISPER_MODEL=small
-RUN python -c "from faster_whisper import WhisperModel; WhisperModel('${WHISPER_MODEL}', device='cpu', compute_type='int8')"
+ARG WHISPER_LIVE_MODEL=base.en
+RUN python -c "from faster_whisper import WhisperModel; [WhisperModel(m, device='cpu', compute_type='int8') for m in ('${WHISPER_MODEL}', '${WHISPER_LIVE_MODEL}')]"
 
 RUN useradd -r -u 10001 bot && mkdir -p /data && chown -R bot:bot /data /models
 USER bot

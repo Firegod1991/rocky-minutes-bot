@@ -1,0 +1,108 @@
+import time
+from pathlib import Path
+
+import numpy as np
+
+from bot.assistant import format_find, parse_command, parse_wake, wake_pattern
+from bot.knowledge import KnowledgeBase, chunks, fts_query, google_links
+
+W = wake_pattern(["rocky"])
+
+
+def test_wake_variants():
+    assert parse_wake("Rocky, pull up the risk register.", W) == "pull up the risk register"
+    assert parse_wake("Hey Rocky pull up the doc", W) == "pull up the doc"
+    assert parse_wake("Rockie: stop recording", W) == "stop recording"
+    assert parse_wake("rocky", W) == ""
+    assert parse_wake("Rocky.", W) == ""
+    assert parse_wake("Okay, Rocky, what did we decide?", W) == "what did we decide?"
+    assert parse_wake("I think Rocky should do it", W) is None
+    assert parse_wake("the rocket is ready", W) is None
+
+
+def test_parse_commands():
+    assert parse_command("pull up the google doc talking about computer systems").kind == "find"
+    assert parse_command("pull up the google doc talking about computer systems").arg == "the google doc talking about computer systems"
+    assert parse_command("can you bring up the risk register").kind == "find"
+    assert parse_command("where's the thermal spreadsheet").kind == "find"
+    c = parse_command("action item: Michael finishes the thermal model by Friday")
+    assert (c.kind, c.arg) == ("action", "Michael finishes the thermal model by Friday")
+    assert parse_command("add an action item Paige sends the budget").kind == "action"
+    assert parse_command("stop recording").kind == "stop"
+    assert parse_command("take notes now").kind == "notes"
+    assert parse_command("post the minutes").kind == "notes"
+    assert parse_command("help").kind == "help"
+    assert parse_command("").kind == "help"
+    c = parse_command("what did we decide about the launch date?")
+    assert c.kind == "ask"
+
+
+def test_google_links():
+    t = ("see https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit?usp=sharing and "
+         "<https://docs.google.com/spreadsheets/d/1ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ/edit#gid=0>")
+    links = google_links(t)
+    assert [(k, i[:4]) for k, i, _ in links] == [("document", "1AbC"), ("spreadsheets", "1ZZZ")]
+    assert not links[1][2].endswith(">")
+
+
+def test_fts_query_drops_filler():
+    q = fts_query("the google doc talking about computer systems")
+    assert '"computer"*' in q and '"systems"*' in q and "google" not in q and "talking" not in q
+
+
+def test_chunks():
+    text = "\n".join(f"paragraph {i} " + "x" * 300 for i in range(20))
+    parts = chunks(text, 1500)
+    assert all(len(p) <= 1500 for p in parts) and len(parts) > 3
+
+
+def test_search_prefers_files_and_dedupes(tmp_path: Path):
+    kb = KnowledgeBase(tmp_path / "kb.db")
+    now = time.time()
+    kb.upsert("msg:1", "msg", 1, "general", "fire", "https://discord.com/x/1",
+              "computer chat", "hey has anyone seen the computer systems doc", now)
+    body = "Computer Systems Design\n" + "\n".join(f"The flight computer uses subsystem {i}." for i in range(200))
+    kb.upsert("gdoc:abc", "gdoc", 1, "important-links", "mike", "https://docs.google.com/document/d/abc",
+              "Google Doc: Computer Systems Design", body, now)
+    kb.upsert("gdoc:zzz", "gdoc", 2, "x", "y", "https://docs.google.com/document/d/zzz",
+              "Google Doc: Computer Systems (other server)", "computer systems", now)
+    hits = kb.search("the google doc talking about computer systems", guild_id=1)
+    assert hits[0].url == "https://docs.google.com/document/d/abc"
+    assert sum(1 for h in hits if h.url.endswith("/abc")) == 1  # chunks deduped
+    assert all("zzz" not in h.url for h in hits)  # other guild excluded
+    files = kb.search("computer systems", guild_id=1, kinds=("gdoc",))
+    assert len(files) == 1
+    out = format_find("computer systems", hits)
+    assert "Computer Systems Design" in out and "docs.google.com/document/d/abc" in out
+    # re-upsert replaces, delete removes
+    kb.upsert("msg:1", "msg", 1, "general", "fire", "u", "t", "totally different words", now)
+    assert all(h.key != "msg:1" for h in kb.search("computer", guild_id=1))
+    kb.delete("gdoc:abc")
+    assert not kb.search("subsystem", guild_id=1)
+
+
+def test_live_listener_endpointing():
+    import asyncio
+    import bot.live as live
+
+    heard = []
+
+    async def on_text(uid, name, t, text):
+        heard.append((uid, name, text))
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        lst = live.LiveListener(loop, on_text, "unused", transcriber=lambda a: f"len={a.size}")
+        frame = np.ones(320, dtype=np.int16) * 1000  # 20 ms at 16 kHz
+        for _ in range(50):  # 1 s of speech from user 1
+            lst.feed(1, "fire", frame)
+        for _ in range(5):  # 0.1 s from user 2: too short, dropped
+            lst.feed(2, "mike", frame)
+        await asyncio.sleep(1.4)
+        lst.close()
+        await asyncio.sleep(0.2)
+        return lst
+
+    lst = asyncio.run(run())
+    assert heard == [(1, "fire", "len=16000")]
+    assert "fire: len=16000" in lst.transcript_so_far()

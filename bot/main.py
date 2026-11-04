@@ -15,12 +15,18 @@ import discord
 from discord import app_commands
 from discord.ext import voice_recv
 
+from .assistant import HELP_TEXT, answer_question, format_find, parse_command, parse_wake, wake_pattern
 from .config import Config
-from .merge import Segment, coalesce, render_transcript
+from .indexer import Indexer
+from .knowledge import KnowledgeBase
+from .live import LiveListener
+from .merge import Segment, chunk_text, coalesce, render_transcript
 from .minutes import generate_minutes
 from .publisher import Settings, get_minutes_channel, post_minutes, post_notice, post_transcript_thread
 from .recorder import Session, TimelineSink
 from .transcribe import transcribe_session_dir
+
+FOLLOWUP_WINDOW_S = 8.0  # after a bare "Rocky", the same speaker's next sentence is the command
 
 log = logging.getLogger("minutes")
 
@@ -49,6 +55,11 @@ class Coordinator:
         self.channel_lock = asyncio.Lock()
         # one worker: whisper is CPU heavy, process meetings one at a time
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper")
+        self.kb = KnowledgeBase(cfg.data_dir / "knowledge.db")
+        self.indexer = Indexer(cfg, self.kb)
+        self.wake = wake_pattern(cfg.wake_words)
+        # channels told to stop by voice/text; Rocky stays out until they empty
+        self.paused: set[tuple[int, int]] = set()
 
     def claim(self, guild_id: int, channel_id: int, bot: "MinutesBot") -> bool:
         key = (guild_id, channel_id)
@@ -74,6 +85,9 @@ class MinutesBot(discord.Client):
         intents.guilds = True
         intents.voice_states = True
         intents.members = True  # privileged: needed for display names in notes
+        if index == 0 and cfg.text_commands:
+            intents.guild_messages = True
+            intents.message_content = True  # privileged: needed to index chat and answer @mentions
         super().__init__(intents=intents)
         self.cfg = cfg
         self.coord = coord
@@ -103,6 +117,7 @@ class MinutesBot(discord.Client):
         else:
             await self.tree.sync()
             log.info("slash commands synced globally (can take up to an hour to appear)")
+        self.coord.indexer.start()
         self._spawn(self._resume_unprocessed())
 
     async def on_ready(self) -> None:
@@ -110,6 +125,10 @@ class MinutesBot(discord.Client):
         # catch meetings already in progress when the bot starts
         for guild in self.guilds:
             await self._scan_guild(guild)
+        if self.primary and self.cfg.text_commands and not getattr(self, "_backfilled", False):
+            self._backfilled = True
+            for guild in self.guilds:
+                self._spawn(self.coord.indexer.backfill(guild, self.settings.get_channel_id(guild.id)))
 
     async def _scan_guild(self, guild: discord.Guild) -> None:
         """Join the busiest eligible voice channel if we are idle in this guild."""
@@ -118,7 +137,7 @@ class MinutesBot(discord.Client):
         candidates = [
             vc for vc in guild.voice_channels + guild.stage_channels
             if self._eligible(guild, vc) and len(_humans(vc)) >= self.cfg.min_participants
-            and (guild.id, vc.id) not in self.coord.claims
+            and (guild.id, vc.id) not in self.coord.claims and (guild.id, vc.id) not in self.coord.paused
         ]
         if candidates:
             await self.start_session(max(candidates, key=lambda c: len(_humans(c))))
@@ -130,6 +149,8 @@ class MinutesBot(discord.Client):
                 await self.end_session(gid, reason="bot shutdown", process=False)
             except Exception:
                 log.exception("finalizing session for guild %s", gid)
+        if self.primary:
+            await self.coord.indexer.close()
         await super().close()
 
     async def _minutes_channel(self, guild: discord.Guild):
@@ -170,19 +191,26 @@ class MinutesBot(discord.Client):
         if member.bot or before.channel == after.channel:
             return
 
+        # a channel emptied: forget any "stop recording" for it
+        if before.channel is not None and not _humans(before.channel):
+            self.coord.paused.discard((guild.id, before.channel.id))
+
         # someone joined a channel
         if after.channel is not None and self._eligible(guild, after.channel):
             if session is None:
                 if (len(_humans(after.channel)) >= self.cfg.min_participants
-                        and (guild.id, after.channel.id) not in self.coord.claims):
+                        and (guild.id, after.channel.id) not in self.coord.claims
+                        and (guild.id, after.channel.id) not in self.coord.paused):
                     await self.start_session(after.channel)
             elif session.channel_id == after.channel.id:
                 session.participants.setdefault(member.id, member.display_name)
                 self._cancel_leave(session)
             else:
                 # the meeting moved rooms: follow it if the room we record is now empty
+                # and no other Rocky account already took the new room
                 current = guild.get_channel(session.channel_id)
-                if current is None or not _humans(current):
+                taken = (guild.id, after.channel.id) in self.coord.claims
+                if (current is None or not _humans(current)) and not taken:
                     await self._follow(session, after.channel)
                     return
 
@@ -262,13 +290,25 @@ class MinutesBot(discord.Client):
             session.sink = sink
             for m in _humans(channel):
                 session.participants[m.id] = m.display_name
+            if self.cfg.voice_commands:
+                session.live = LiveListener(
+                    asyncio.get_running_loop(),
+                    lambda uid, name, t, text, s=session: self.on_live_text(s, uid, name, t, text),
+                    self.cfg.live_model,
+                    # glossary style priming: biases spelling without making Whisper skip the wake word
+                    prompt="Glossary: " + ", ".join(
+                        [w.title() for w in self.cfg.wake_words] + ([self.cfg.whisper_prompt] if self.cfg.whisper_prompt else [])
+                    ) + ".",
+                )
+                sink.live = session.live
             vc.listen(sink)
             session.save_meta("recording")
             log.info("recording %s / #%s -> %s", guild.name, channel.name, sdir.name)
             if self.cfg.announce_recording:
                 notes = await self._minutes_channel(guild)
-                await post_notice(notes, f"Recording started in **{channel.name}**. Notes will be posted here about "
-                                         f"{self.cfg.publish_delay_seconds // 60} minutes after the meeting ends.")
+                when = ("when the meeting ends" if self.cfg.publish_delay_seconds < 60 else
+                        f"about {self.cfg.publish_delay_seconds // 60} minutes after the meeting ends")
+                await post_notice(notes, f"Recording started in **{channel.name}**. Notes will be posted here {when}.")
             self._spawn(self._max_duration_guard(session))
             return session
         except Exception:
@@ -306,6 +346,8 @@ class MinutesBot(discord.Client):
             log.exception("stop_listening failed")
         if session.sink and not session.sink.finished:
             session.sink.cleanup()
+        if session.live is not None:
+            session.live.close()
         try:
             if vc:
                 await vc.disconnect(force=True)
@@ -368,6 +410,7 @@ class MinutesBot(discord.Client):
             participants = sorted(set(meta.get("participants", {}).values()) | {s.speaker for s in merged})
             minutes_md, mode = await generate_minutes(
                 self.cfg, title, started, float(meta.get("duration_seconds", 0)), participants, transcript, merged,
+                logged_items=meta.get("action_items") or [],
             )
 
             stamp = started.astimezone().strftime("%Y-%m-%d_%H%M")
@@ -380,6 +423,7 @@ class MinutesBot(discord.Client):
             )
             minutes_path.write_text(minutes_md)
 
+            anchor = None
             if notes is None:
                 log.error("no minutes channel in %s; files saved in %s", guild.name, sdir)
                 meta["status"] = "no_channel"
@@ -390,6 +434,11 @@ class MinutesBot(discord.Client):
                 meta["status"] = "published"
                 meta["summary_mode"] = mode
                 log.info("published minutes for %s to #%s (%s)", sdir.name, notes.name, mode)
+            # past meetings become searchable ("Rocky, what did we decide last week about...")
+            self.coord.indexer.index_meeting(
+                guild.id, sdir.name, meta["channel_name"], f"{title} ({started.astimezone():%b %d})",
+                transcript, minutes_md, anchor.jump_url if anchor else "", started.timestamp(),
+            )
             if not self.cfg.keep_audio:
                 for wav in sdir.glob("*.wav"):
                     wav.unlink(missing_ok=True)
@@ -400,6 +449,137 @@ class MinutesBot(discord.Client):
                                      f"({meta.get('started_at')}). Check the bot logs.")
         finally:
             meta_path.write_text(json.dumps(meta, indent=2))
+
+    # assistant: voice + text commands ----------------------------------------
+    async def on_live_text(self, session: Session, user_id: int, name: str, t: float, text: str) -> None:
+        if self.sessions.get(session.guild_id) is not session:
+            return
+        rest = parse_wake(text, self.coord.wake)
+        now = asyncio.get_running_loop().time()
+        if rest is None:
+            since = session.awaiting.get(user_id)
+            if since is None or now - since > FOLLOWUP_WINDOW_S:
+                return
+            rest = text.strip()
+        session.awaiting.pop(user_id, None)
+        guild = self.get_guild(session.guild_id)
+        channel = guild.get_channel(session.channel_id) if guild else None
+        if channel is None:
+            return
+        if not rest:
+            session.awaiting[user_id] = now
+            await self._send(channel, f"Go ahead, {name}.")
+            return
+        log.info("voice command from %s in #%s: %s", name, session.channel_name, rest)
+        cmd = parse_command(rest)
+
+        async def reply(msg: str) -> None:
+            await self._send(channel, f"> {name}: *{rest}*\n{msg}")
+
+        await self.run_command(cmd, guild, reply, asker=name, owner=self, session=session)
+
+    async def run_command(self, cmd, guild: discord.Guild, reply, asker: str,
+                          owner: Optional["MinutesBot"], session: Optional[Session]) -> None:
+        kb = self.coord.kb
+        if cmd.kind == "help":
+            return await reply(HELP_TEXT)
+        if cmd.kind == "find":
+            hits = kb.search(cmd.arg, guild_id=guild.id, kinds=("gdoc", "file"), limit=3)
+            if not hits:
+                hits = kb.search(cmd.arg, guild_id=guild.id, limit=3)
+            return await reply(format_find(cmd.arg, hits))
+        if cmd.kind == "ask":
+            so_far = session.live.transcript_so_far() if session and session.live else ""
+            return await reply(await answer_question(self.cfg, kb, guild.id, cmd.arg, asker, so_far))
+        if session is None or owner is None:
+            return await reply("I'm not recording a meeting you're in right now. Join the voice channel first.")
+        if cmd.kind == "action":
+            elapsed = (datetime.now(timezone.utc) - session.started_at).total_seconds()
+            session.action_items.append({"by": asker, "text": cmd.arg, "t": elapsed})
+            session.save_meta("recording")
+            return await reply(f"Logged action item: **{cmd.arg}**. It'll be in the notes.")
+        if cmd.kind == "stop":
+            self.coord.paused.add((session.guild_id, session.channel_id))
+            session.manual = True
+            await reply("Stopped recording. Notes are on the way to #meeting-minutes. "
+                        "I'll stay out of this channel until everyone leaves it.")
+            await owner.end_session(session.guild_id, reason="stopped by command")
+            return
+        if cmd.kind == "notes":
+            ch = guild.get_channel(session.channel_id)
+            session.manual = True
+            await reply("Posting notes for the meeting so far to #meeting-minutes. Still recording.")
+            await owner.end_session(session.guild_id, reason="notes requested")
+            if ch is not None and _humans(ch):
+                await owner.start_session(ch)
+
+    async def _send(self, channel, text: str) -> None:
+        for chunk in chunk_text(text, 1900):
+            try:
+                await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True)
+            except Exception:
+                log.warning("could not send to #%s", getattr(channel, "name", "?"), exc_info=True)
+                return
+
+    def _session_for(self, member) -> tuple[Optional["MinutesBot"], Optional[Session]]:
+        vc = getattr(getattr(member, "voice", None), "channel", None)
+        if vc is None:
+            return None, None
+        for b in self.coord.bots:
+            s = b.sessions.get(vc.guild.id)
+            if s and s.channel_id == vc.id:
+                return b, s
+        return None, None
+
+    def _addressed(self, message: discord.Message) -> Optional[str]:
+        """Command text if the message @mentions Rocky (user or its role), else None."""
+        me = message.guild.me if message.guild else None
+        hit = self.user in message.mentions
+        my_roles = {r.id for r in getattr(me, "roles", []) if r.managed} if me else set()
+        if not hit and any(r.id in my_roles for r in message.role_mentions):
+            hit = True
+        if not hit:
+            return None
+        text = re.sub(rf"<@!?{self.user.id}>", "", message.content)
+        for rid in my_roles:
+            text = text.replace(f"<@&{rid}>", "")
+        return text.strip(" ,:")
+
+    async def on_message(self, message: discord.Message) -> None:
+        if not self.primary or not self.cfg.text_commands or message.guild is None:
+            return
+        try:
+            self.coord.indexer.index_message(message, self.settings.get_channel_id(message.guild.id))
+        except Exception:
+            log.exception("indexing failed")
+        if message.author.bot:
+            return
+        text = self._addressed(message)
+        if text is None:
+            return
+        owner, session = self._session_for(message.author)
+        asker = message.author.display_name
+
+        async def reply(msg: str) -> None:
+            chunks_ = chunk_text(msg, 1900)
+            try:
+                await message.reply(chunks_[0], mention_author=False, suppress_embeds=True,
+                                    allowed_mentions=discord.AllowedMentions.none())
+            except Exception:
+                await self._send(message.channel, chunks_[0])
+            for c in chunks_[1:]:
+                await self._send(message.channel, c)
+
+        async with message.channel.typing():
+            await self.run_command(parse_command(text), message.guild, reply, asker, owner, session)
+
+    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
+        if self.primary and self.cfg.text_commands and after.guild is not None and before.content != after.content:
+            self.coord.indexer.index_message(after, self.settings.get_channel_id(after.guild.id))
+
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        if self.primary:
+            self.coord.kb.delete(f"msg:{payload.message_id}")
 
     # slash commands -------------------------------------------------------
     def _register_commands(self) -> None:
@@ -465,6 +645,20 @@ class MinutesBot(discord.Client):
             await inter.response.send_message(f"Notes will be posted in {channel.mention}.", ephemeral=True)
 
         self.tree.add_command(group)
+
+        @self.tree.command(name="ask", description="Ask Rocky: find a doc or answer from channels, shared files and past meetings")
+        @app_commands.describe(question="e.g. 'pull up the computer systems doc' or 'what did we decide about the launch date?'")
+        async def ask(inter: discord.Interaction, question: str):
+            await inter.response.defer(thinking=True)
+            owner, session = self._session_for(inter.user)
+
+            async def reply(msg: str) -> None:
+                chunks_ = chunk_text(f"> {question}\n{msg}", 1900)
+                for c in chunks_:
+                    await inter.followup.send(c, suppress_embeds=True, allowed_mentions=discord.AllowedMentions.none())
+
+            await self.run_command(parse_command(question), inter.guild, reply,
+                                   inter.user.display_name, owner, session)
 
 
 def main() -> None:
