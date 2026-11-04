@@ -42,6 +42,10 @@ class Config:
     post_transcript_inline: bool = field(default_factory=lambda: _bool("POST_TRANSCRIPT_INLINE", True))
     anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
     claude_model: str = field(default_factory=lambda: os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5"))
+    # Free local fallback when no Anthropic key is set. Empty OLLAMA_URL disables it.
+    ollama_url: str = field(default_factory=lambda: os.getenv("OLLAMA_URL", "http://host.docker.internal:11434"))
+    ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "qwen3:8b"))
+    ollama_ctx: int = field(default_factory=lambda: _int("OLLAMA_CTX", 16384))
 
     # Whisper
     whisper_model: str = field(default_factory=lambda: os.getenv("WHISPER_MODEL", "small"))

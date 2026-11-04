@@ -122,3 +122,28 @@ def test_format_docs_and_mentions():
                        ("Google Sheet: Budget", "https://docs.google.com/spreadsheets/d/y", "private")])
     assert "[Google Doc: Org Chart](https://docs.google.com/document/d/x)" in out and "link only" in out
     assert _clean("<@123> hi <@&456>") == "@someone hi @someone"
+
+
+def test_minutes_long_meeting_chunked_on_local_model(monkeypatch):
+    import asyncio
+    from datetime import datetime, timezone
+    from bot import llm, minutes
+    from bot.config import Config
+    from bot.merge import Segment
+
+    calls = []
+
+    async def fake_complete(cfg, system, user, max_tokens=1500):
+        calls.append(user)
+        return "**Summary**\nok" if "Write the minutes" in user else "part notes"
+
+    monkeypatch.setattr(llm, "complete", fake_complete)
+    cfg = Config(discord_token="x", anthropic_api_key="", ollama_url="http://x", ollama_ctx=8192)
+    transcript = "\n".join(f"[00:00:{i % 60:02d}] fire: " + "word " * 40 for i in range(400))
+    md, mode = asyncio.run(minutes.generate_minutes(
+        cfg, "T", datetime.now(timezone.utc), 60, ["fire"], transcript, [Segment(0, 1, "fire", "x")]))
+    assert mode == "ollama" and "ok" in md
+    assert len(calls) > 2 and "part notes" in calls[-1]  # parts first, then final minutes from the notes
+
+    cfg2 = Config(discord_token="x", anthropic_api_key="", ollama_url="")
+    assert not llm.enabled(cfg2)

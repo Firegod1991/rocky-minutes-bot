@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+from . import llm
 from .config import Config
 from .merge import Segment, fmt_ts, talk_time
 
@@ -38,7 +39,8 @@ Bulleted list of the main topics discussed. Attribute positions to speakers by u
 Bulleted list of decisions actually made. Write "None recorded" if there were none.
 
 **Action Items**
-Bulleted list in the form `@username: task (deadline if stated)`. Write "None recorded" if there were none.
+Bulleted list in the form `@username: task (deadline if stated)`. Include every commitment anyone made, including
+"I will ..." statements, not only tasks assigned to others. Write "None recorded" if there were none.
 
 **Open Questions**
 Bulleted list of unresolved questions or things to follow up on. Write "None" if there were none.
@@ -83,13 +85,13 @@ async def generate_minutes(
 
     body = ""
     mode = "fallback"
-    if cfg.anthropic_api_key:
+    if llm.enabled(cfg):
         try:
             extra = f"\n\nAction items logged by voice during the meeting (include them):\n{logged}" if logged else ""
-            body = await _ask_claude(cfg, title, started, duration_s, participants, transcript + extra)
-            mode = "claude"
+            body = await _ask_llm(cfg, title, started, duration_s, participants, transcript, extra)
+            mode = llm.provider(cfg)
         except Exception:
-            log.exception("Claude summarization failed; posting transcript only")
+            log.exception("summarization failed; posting transcript only")
     if not body:
         body = "Automatic summary unavailable. Full transcript attached.\n"
         if logged:
@@ -105,23 +107,41 @@ def logged_items_block(items: list[dict]) -> str:
     return "**Action Items (logged by voice)**\n" + "\n".join(lines) + "\n"
 
 
-async def _ask_claude(cfg, title, started, duration_s, participants, transcript) -> str:
-    from anthropic import AsyncAnthropic
+PART_PROMPT = """This is part {i} of {n} of a meeting transcript (timestamps HH:MM:SS from the start).
+<transcript>
+{chunk}
+</transcript>
+Write dense notes for this part only: topics discussed with who said what, every decision, every commitment or task
+(who, what, deadline if stated), and unresolved questions. Keep timestamps for key moments. No preamble."""
 
-    client = AsyncAnthropic(api_key=cfg.anthropic_api_key, max_retries=3, timeout=180)
-    if len(transcript) > MAX_TRANSCRIPT_CHARS:
-        transcript = transcript[:MAX_TRANSCRIPT_CHARS] + "\n[transcript truncated]"
+
+def _local_budget(cfg) -> int:
+    # characters of transcript that fit a local model's context alongside the prompt and the answer
+    return max(8_000, int(cfg.ollama_ctx * 3.2) - 9_000)
+
+
+async def _ask_llm(cfg, title, started, duration_s, participants, transcript, extra="") -> str:
+    limit = MAX_TRANSCRIPT_CHARS if llm.provider(cfg) == "claude" else _local_budget(cfg)
+    if len(transcript) > limit:
+        # long meeting on a small context model: summarize in parts, then write minutes from the part notes
+        lines, parts, cur = transcript.splitlines(keepends=True), [], ""
+        for line in lines:
+            if len(cur) + len(line) > limit and cur:
+                parts.append(cur)
+                cur = ""
+            cur += line
+        if cur:
+            parts.append(cur)
+        notes = []
+        for i, chunk in enumerate(parts, 1):
+            notes.append(await llm.complete(cfg, SYSTEM, PART_PROMPT.format(i=i, n=len(parts), chunk=chunk), 1200))
+        transcript = "\n\n".join(f"(notes for part {i})\n{n}" for i, n in enumerate(notes, 1))
+        log.info("long meeting summarized in %d parts", len(parts))
     prompt = PROMPT.format(
         title=title,
         date=started.astimezone().strftime("%Y-%m-%d %H:%M %Z"),
         duration=fmt_ts(duration_s),
         participants=", ".join(participants) or "unknown",
-        transcript=transcript,
+        transcript=transcript + extra,
     )
-    resp = await client.messages.create(
-        model=cfg.claude_model,
-        max_tokens=1500,
-        system=SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return "".join(getattr(b, "text", "") for b in resp.content).strip()
+    return await llm.complete(cfg, SYSTEM, prompt, 1500)

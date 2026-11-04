@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+from . import llm
 from .config import Config
 from .knowledge import Hit, KnowledgeBase
 
@@ -158,22 +159,17 @@ ASK_SYSTEM = (
 async def answer_question(cfg: Config, kb: KnowledgeBase, guild_id: int, question: str, asker: str,
                           meeting_so_far: str = "") -> str:
     hits = kb.search(question, guild_id=guild_id, limit=8)
-    if not cfg.anthropic_api_key:
-        head = "I can't write answers yet (no ANTHROPIC_API_KEY set), but these look relevant:\n"
+    if not llm.enabled(cfg):
+        head = "I can't write answers yet (no language model configured), but these look relevant:\n"
         return head + format_find(question, hits).split("\n", 1)[-1] if hits else format_find(question, hits)
-    from anthropic import AsyncAnthropic
-
-    client = AsyncAnthropic(api_key=cfg.anthropic_api_key, max_retries=2, timeout=60)
-    content = f"Question from {asker}: {question}\n\n<sources>\n{sources_block(hits) or '(none found)'}\n</sources>"
+    local = llm.provider(cfg) == "ollama"
+    content = (f"Question from {asker}: {question}\n\n<sources>\n"
+               f"{sources_block(hits, max_chars=7_000 if local else 14_000) or '(none found)'}\n</sources>")
     if meeting_so_far:
-        content += f"\n\n<live_meeting_transcript>\n{meeting_so_far[-12000:]}\n</live_meeting_transcript>"
+        content += f"\n\n<live_meeting_transcript>\n{meeting_so_far[-(6000 if local else 12000):]}\n</live_meeting_transcript>"
     try:
-        resp = await client.messages.create(
-            model=cfg.claude_model, max_tokens=600, system=ASK_SYSTEM,
-            messages=[{"role": "user", "content": content}],
-        )
-        text = "".join(getattr(b, "text", "") for b in resp.content).strip()
+        text = await llm.complete(cfg, ASK_SYSTEM, content, 600)
         return text or format_find(question, hits)
     except Exception:
-        log.exception("Claude answer failed")
+        log.exception("answer failed")
         return "I hit an error writing that answer. Closest matches:\n" + format_find(question, hits).split("\n", 1)[-1]
