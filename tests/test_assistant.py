@@ -174,3 +174,9 @@ def test_cloud_failure_falls_back_to_ollama(monkeypatch):
     cfg = Config(discord_token="x", anthropic_api_key="", gemini_api_key="g", ollama_url="http://x")
     assert asyncio.run(llm.complete(cfg, "s", "u")) == "local answer"
     assert seen == ["gemini", "ollama"]
+
+
+def test_speakable_strips_chat_formatting():
+    from bot.speech import speakable
+    s = speakable("The **total weight** is 155 kg [1], margin 12 kg. <https://docs.google.com/x> [doc](https://x.y) <@123>")
+    assert s == "The total weight is 155 kg, margin 12 kg. doc someone"

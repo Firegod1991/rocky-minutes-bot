@@ -15,7 +15,9 @@ import discord
 from discord import app_commands
 from discord.ext import voice_recv
 
-from .assistant import HELP_TEXT, answer_question, format_docs, format_find, parse_command, parse_wake, wake_pattern
+from .assistant import (HELP_TEXT, answer_question, answer_with_hits, format_docs, format_find, parse_command,
+                        parse_wake, source_links, wake_pattern)
+from .speech import Speaker, speakable
 from .config import Config
 from .indexer import Indexer
 from .knowledge import KnowledgeBase
@@ -104,6 +106,7 @@ class MinutesBot(discord.Client):
         self.sessions_dir = cfg.data_dir / "sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self.executor = coord.executor
+        self.speaker = Speaker(cfg.piper_dir, cfg.tts_voice)
         self._bg: set[asyncio.Task] = set()
         if self.primary:
             self._register_commands()
@@ -472,9 +475,13 @@ class MinutesBot(discord.Client):
         channel = guild.get_channel(session.channel_id) if guild else None
         if channel is None:
             return
+        say = self._sayer(guild)
         if not rest:
             session.awaiting[user_id] = now
-            await self._send(channel, f"Go ahead, {name}.")
+            if say:
+                self._spawn(say("Yes?"))
+            else:
+                await self._send(channel, f"Go ahead, {name}.")
             return
         log.info("voice command from %s in #%s: %s", name, session.channel_name, rest)
         cmd = parse_command(rest)
@@ -482,22 +489,57 @@ class MinutesBot(discord.Client):
         async def reply(msg: str) -> None:
             await self._send(channel, f"> {name}: *{rest}*\n{msg}")
 
-        await self.run_command(cmd, guild, reply, asker=name, owner=self, session=session)
+        await self.run_command(cmd, guild, reply, asker=name, owner=self, session=session, say=say)
+
+    def _sayer(self, guild: discord.Guild):
+        """Coroutine fn that speaks into this bot's voice connection, or None if voice replies are off."""
+        if not self.cfg.voice_replies:
+            return None
+        vc = guild.voice_client
+
+        async def say(text: str) -> None:
+            try:
+                await self.speaker.say(vc, text)
+            except Exception:
+                log.exception("speaking failed")
+
+        return say
 
     async def run_command(self, cmd, guild: discord.Guild, reply, asker: str,
-                          owner: Optional["MinutesBot"], session: Optional[Session]) -> None:
+                          owner: Optional["MinutesBot"], session: Optional[Session], say=None) -> None:
+        """reply posts text; say (voice only) speaks. Spoken lines stay short; details go to the chat."""
         kb = self.coord.kb
+
+        def speak(text: str) -> None:
+            if say:
+                self._spawn(say(text))
+
         if cmd.kind == "help":
+            speak("Say Rocky, then ask a question, ask me to pull up a doc, log an action item, "
+                  "take notes now, or stop recording. Full list is in the chat.")
             return await reply(HELP_TEXT)
         if cmd.kind == "docs":
-            return await reply(format_docs(kb.list_files(guild.id)))
+            files = kb.list_files(guild.id)
+            speak(f"I can see {len(files)} shared file{'s' if len(files) != 1 else ''}. The list is in the chat."
+                  if files else "I don't see any shared Google files yet.")
+            return await reply(format_docs(files))
         if cmd.kind == "find":
             hits = kb.search(cmd.arg, guild_id=guild.id, kinds=("gdoc", "file"), limit=3)
             if not hits:
                 hits = kb.search(cmd.arg, guild_id=guild.id, limit=3)
+            if hits:
+                top = speakable(hits[0].title if hits[0].is_file else "a message about it")
+                speak(f"Found {top}. Link's in the chat.")
+            else:
+                speak("I couldn't find anything on that. If it's a Google doc, someone needs to post the link.")
             return await reply(format_find(cmd.arg, hits))
         if cmd.kind == "ask":
             so_far = session.live.transcript_so_far() if session and session.live else ""
+            if say:
+                text, hits = await answer_with_hits(self.cfg, kb, guild.id, cmd.arg, asker, so_far, spoken=True)
+                speak(text)
+                links = source_links(hits)
+                return await reply(text + (f"\n{links}" if links else ""))
             return await reply(await answer_question(self.cfg, kb, guild.id, cmd.arg, asker, so_far))
         if session is None or owner is None:
             return await reply("I'm not recording a meeting you're in right now. Join the voice channel first.")
@@ -505,18 +547,23 @@ class MinutesBot(discord.Client):
             elapsed = (datetime.now(timezone.utc) - session.started_at).total_seconds()
             session.action_items.append({"by": asker, "text": cmd.arg, "t": elapsed})
             session.save_meta("recording")
+            speak("Logged.")
             return await reply(f"Logged action item: **{cmd.arg}**. It'll be in the notes.")
         if cmd.kind == "stop":
             self.coord.paused.add((session.guild_id, session.channel_id))
             session.manual = True
             await reply("Stopped recording. Notes are on the way to #meeting-minutes. "
                         "I'll stay out of this channel until everyone leaves it.")
+            if say:
+                await say("Stopping. Notes are on the way.")  # finish talking before we hang up
             await owner.end_session(session.guild_id, reason="stopped by command")
             return
         if cmd.kind == "notes":
             ch = guild.get_channel(session.channel_id)
             session.manual = True
             await reply("Posting notes for the meeting so far to #meeting-minutes. Still recording.")
+            if say:
+                await say("Posting notes now. I'll keep recording.")
             await owner.end_session(session.guild_id, reason="notes requested")
             if ch is not None and _humans(ch):
                 await owner.start_session(ch)

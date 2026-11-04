@@ -20,6 +20,10 @@ ARG WHISPER_MODEL=small
 ARG WHISPER_LIVE_MODEL=base.en
 RUN python -c "from faster_whisper import WhisperModel; [WhisperModel(m, device='cpu', compute_type='int8') for m in ('${WHISPER_MODEL}', '${WHISPER_LIVE_MODEL}')]"
 
+# Rocky's speaking voice (local Piper text to speech)
+ARG TTS_VOICE=en_US-ryan-high
+RUN python -m piper.download_voices --download-dir /models/piper ${TTS_VOICE}
+
 # code last, so code changes don't re-download the models
 COPY bot ./bot
 

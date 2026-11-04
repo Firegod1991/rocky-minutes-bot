@@ -6,3 +6,4 @@ discord-ext-voice-recv @ git+https://github.com/zacker150/discord-ext-voice-recv
 faster-whisper==1.2.1
 anthropic==2.4.0
 numpy>=2.0,<3
+piper-tts==1.8.0

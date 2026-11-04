@@ -156,20 +156,48 @@ ASK_SYSTEM = (
 )
 
 
+VOICE_SYSTEM = (
+    "You are Rocky, the team's assistant, answering OUT LOUD in a Discord voice call. Use only the sources and the live "
+    "meeting transcript provided. Reply in one to three short spoken sentences: plain conversational English, no lists, "
+    "no links, no citations, no markdown, numbers written the way you'd say them. Personality: calm, precise, dry and "
+    "deadpan, like a seasoned mission robot; a brief wry aside is fine now and then, but the answer always comes first. "
+    "If the sources don't have the answer, say so in one sentence and say where it might be found."
+)
+
+
+def source_links(hits: list[Hit], limit: int = 3) -> str:
+    out = []
+    for h in hits[:limit]:
+        label = _clean(h.title if h.is_file else (h.snippet or h.title))[:70] or "source"
+        if h.url:
+            out.append(f"[{label}]({h.url})")
+    return ("Sources: " + " · ".join(out)) if out else ""
+
+
 async def answer_question(cfg: Config, kb: KnowledgeBase, guild_id: int, question: str, asker: str,
-                          meeting_so_far: str = "") -> str:
+                          meeting_so_far: str = "", spoken: bool = False) -> str:
+    text, _ = await answer_with_hits(cfg, kb, guild_id, question, asker, meeting_so_far, spoken)
+    return text
+
+
+async def answer_with_hits(cfg: Config, kb: KnowledgeBase, guild_id: int, question: str, asker: str,
+                           meeting_so_far: str = "", spoken: bool = False) -> tuple[str, list[Hit]]:
     hits = kb.search(question, guild_id=guild_id, limit=8)
     if not llm.enabled(cfg):
+        if spoken:
+            return ("I can't form answers without a language model, but I posted the closest matches in the chat.", hits)
         head = "I can't write answers yet (no language model configured), but these look relevant:\n"
-        return head + format_find(question, hits).split("\n", 1)[-1] if hits else format_find(question, hits)
+        return (head + format_find(question, hits).split("\n", 1)[-1] if hits else format_find(question, hits)), hits
     local = llm.provider(cfg) == "ollama"
     content = (f"Question from {asker}: {question}\n\n<sources>\n"
                f"{sources_block(hits, max_chars=7_000 if local else 14_000) or '(none found)'}\n</sources>")
     if meeting_so_far:
         content += f"\n\n<live_meeting_transcript>\n{meeting_so_far[-(6000 if local else 12000):]}\n</live_meeting_transcript>"
     try:
-        text = await llm.complete(cfg, ASK_SYSTEM, content, 600)
-        return text or format_find(question, hits)
+        text = await llm.complete(cfg, VOICE_SYSTEM if spoken else ASK_SYSTEM, content, 300 if spoken else 600)
+        return (text or format_find(question, hits)), hits
     except Exception:
         log.exception("answer failed")
-        return "I hit an error writing that answer. Closest matches:\n" + format_find(question, hits).split("\n", 1)[-1]
+        if spoken:
+            return "I hit an error working that out. The closest matches are in the chat.", hits
+        return "I hit an error writing that answer. Closest matches:\n" + format_find(question, hits).split("\n", 1)[-1], hits
