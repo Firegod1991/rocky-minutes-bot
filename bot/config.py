@@ -68,13 +68,22 @@ class Config:
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
 
     def validate(self) -> None:
-        if not self.discord_token:
+        if not self.all_tokens:
             raise SystemExit("DISCORD_TOKEN is required")
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
     @property
     def all_tokens(self) -> list[str]:
-        return [self.discord_token] + [t for t in self.extra_tokens if t != self.discord_token]
+        """Primary token first, then extras; blanks and duplicates dropped.
+
+        If DISCORD_TOKEN is empty but DISCORD_EXTRA_TOKENS has one, the first
+        extra becomes the primary so a token on the wrong line still works.
+        """
+        seen: list[str] = []
+        for t in [self.discord_token.strip(), *self.extra_tokens]:
+            if t and t not in seen:
+                seen.append(t)
+        return seen
 
     def channel_allowed(self, channel_id: int) -> bool:
         if channel_id in self.voice_denylist:
