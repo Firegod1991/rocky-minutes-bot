@@ -14,13 +14,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY bot ./bot
-
 # Pre download the Whisper model so first meeting is not slow. Override at build time:
 #   docker build --build-arg WHISPER_MODEL=medium .
 ARG WHISPER_MODEL=small
 ARG WHISPER_LIVE_MODEL=base.en
 RUN python -c "from faster_whisper import WhisperModel; [WhisperModel(m, device='cpu', compute_type='int8') for m in ('${WHISPER_MODEL}', '${WHISPER_LIVE_MODEL}')]"
+
+# code last, so code changes don't re-download the models
+COPY bot ./bot
 
 RUN useradd -r -u 10001 bot && mkdir -p /data && chown -R bot:bot /data /models
 USER bot
