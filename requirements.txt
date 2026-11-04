@@ -1,0 +1,8 @@
+# Voice receive with DAVE (Discord end to end encryption) support.
+# Upstream discord.py / py-cord cannot receive voice under DAVE as of Nov 2026;
+# this fork pulls in its own tested discord.py build automatically.
+discord-ext-voice-recv @ git+https://github.com/zacker150/discord-ext-voice-recv@dcf543a1618d6212f10db5d5dbb7a45f76a955e9
+
+faster-whisper==1.2.1
+anthropic==2.4.0
+numpy>=2.0,<3
