@@ -112,6 +112,7 @@ class KnowledgeBase:
                 key UNINDEXED, kind UNINDEXED, guild_id UNINDEXED, channel, author,
                 url UNINDEXED, title, body, ts UNINDEXED, tokenize='porter unicode61');
             CREATE TABLE IF NOT EXISTS keys(key TEXT PRIMARY KEY, rid INTEGER);
+            CREATE TABLE IF NOT EXISTS vecs(rid INTEGER PRIMARY KEY, vec BLOB);
             CREATE TABLE IF NOT EXISTS files(
                 file_id TEXT PRIMARY KEY, kind TEXT, url TEXT, guild_id INTEGER, channel TEXT,
                 author TEXT, context TEXT, ts REAL, fetched REAL DEFAULT 0, status TEXT DEFAULT 'new', title TEXT);
@@ -125,6 +126,7 @@ class KnowledgeBase:
         for key, rid in rows:
             self.db.execute("DELETE FROM kb WHERE rowid = ?", (rid,))
             self.db.execute("DELETE FROM keys WHERE key = ?", (key,))
+            self.db.execute("DELETE FROM vecs WHERE rid = ?", (rid,))
 
     def upsert(self, key: str, kind: str, guild_id: int, channel: str, author: str, url: str,
                title: str, body: str, ts: float) -> None:
@@ -202,7 +204,7 @@ class KnowledgeBase:
 
     # reads ----------------------------------------------------------------
     def search(self, text: str, guild_id: Optional[int] = None, kinds: Optional[Iterable[str]] = None,
-               limit: int = 8) -> list[Hit]:
+               limit: int = 8, one_per_file: bool = True) -> list[Hit]:
         q = fts_query(text)
         if not q:
             return []
@@ -233,7 +235,7 @@ class KnowledgeBase:
             # files rank above chat chatter about them
             if h.is_file:
                 h.score *= 1.6
-            dedupe = h.url if h.is_file else h.key
+            dedupe = h.url if (h.is_file and one_per_file) else h.key
             if dedupe in seen:
                 continue
             seen.add(dedupe)
@@ -279,3 +281,117 @@ def title_from_text(kind: str, text: str, context: str) -> str:
             return line
     ctx = re.sub(r"https?://\S+", "", context or "").strip()
     return ctx[:80] or KIND_LABEL.get(kind, "Google file")
+
+
+# ---------------------------------------------------------------------------------------------
+# Meaning based search: embeddings from a local Ollama model (nomic-embed-text), stored per chunk.
+
+class Embedder:
+    def __init__(self, url: str, model: str):
+        self.url = (url or "").rstrip("/")
+        self.model = model
+        self.ok = bool(self.url and self.model)
+
+    async def embed(self, texts: list[str], query: bool = False):
+        import aiohttp
+        import numpy as np
+
+        if not self.ok or not texts:
+            return None
+        prefix = "search_query: " if query else "search_document: "
+        body = {"model": self.model, "input": [prefix + t[:6000] for t in texts], "keep_alive": "30m"}
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as s:
+                async with s.post(self.url + "/api/embed", json=body) as r:
+                    if r.status != 200:
+                        log.warning("embedding failed: HTTP %s %s", r.status, (await r.text())[:200])
+                        return None
+                    data = await r.json()
+        except Exception as e:
+            log.warning("embedding unavailable: %s", e)
+            return None
+        v = np.asarray(data.get("embeddings") or [], dtype=np.float32)
+        if v.ndim != 2 or len(v) != len(texts):
+            return None
+        return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-9)
+
+
+def _kb_pending(kb: KnowledgeBase, limit: int) -> list[tuple[int, str]]:
+    with kb._lock:
+        rows = kb.db.execute(
+            "SELECT rowid, title, channel, body FROM kb WHERE rowid NOT IN (SELECT rid FROM vecs) LIMIT ?", (limit,)
+        ).fetchall()
+    return [(rid, f"{title or ''} | {channel or ''}\n{(body or '')[:4000]}") for rid, title, channel, body in rows]
+
+
+async def embed_pending(kb: KnowledgeBase, embedder: Embedder, batch: int = 32) -> int:
+    """Embed chunks that don't have a vector yet. Returns how many were done."""
+    import numpy as np
+
+    done = 0
+    while True:
+        rows = _kb_pending(kb, batch)
+        if not rows:
+            return done
+        vecs = await embedder.embed([t for _, t in rows])
+        if vecs is None:
+            return done
+        with kb._lock:
+            kb.db.executemany("INSERT OR REPLACE INTO vecs(rid, vec) VALUES (?, ?)",
+                              [(rid, np.asarray(v, dtype=np.float32).tobytes()) for (rid, _), v in zip(rows, vecs)])
+            kb.db.commit()
+        done += len(rows)
+
+
+def vector_search(kb: KnowledgeBase, qvec, guild_id: Optional[int], kinds: Optional[Iterable[str]] = None,
+                  limit: int = 20) -> list[Hit]:
+    import numpy as np
+
+    sql = ("SELECT v.rid, v.vec FROM vecs v JOIN kb ON kb.rowid = v.rid WHERE 1=1"
+           + (" AND kb.guild_id = ?" if guild_id is not None else ""))
+    args: list = [guild_id] if guild_id is not None else []
+    kinds = list(kinds or [])
+    if kinds:
+        sql += f" AND kb.kind IN ({','.join('?' * len(kinds))})"
+        args += kinds
+    with kb._lock:
+        rows = kb.db.execute(sql, args).fetchall()
+    if not rows:
+        return []
+    mat = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float32).reshape(len(rows), -1)
+    if mat.shape[1] != qvec.shape[-1]:
+        return []
+    sims = mat @ qvec.reshape(-1)
+    order = np.argsort(-sims)[:limit]
+    rids = [rows[i][0] for i in order]
+    with kb._lock:
+        got = {r[0]: r for r in kb.db.execute(
+            f"SELECT rowid, key, kind, channel, author, url, title, body, ts FROM kb WHERE rowid IN ({','.join('?' * len(rids))})",
+            rids).fetchall()}
+    hits = []
+    for i in order:
+        r = got.get(rows[i][0])
+        if r:
+            body = r[7] or ""
+            hits.append(Hit(key=r[1], kind=r[2], channel=r[3] or "", author=r[4] or "", url=r[5] or "", title=r[6] or "",
+                            snippet=body[:200], body=body, ts=float(r[8] or 0), score=-float(sims[i])))
+    return hits
+
+
+async def hybrid_search(kb: KnowledgeBase, embedder: Optional[Embedder], text: str, guild_id: Optional[int],
+                        kinds: Optional[Iterable[str]] = None, limit: int = 10) -> list[Hit]:
+    """Keyword (FTS) and meaning (embedding) results fused by reciprocal rank; several chunks per file allowed."""
+    fts = kb.search(text, guild_id=guild_id, kinds=kinds, limit=25, one_per_file=False)
+    vec: list[Hit] = []
+    if embedder is not None and embedder.ok:
+        q = await embedder.embed([text], query=True)
+        if q is not None:
+            vec = vector_search(kb, q[0], guild_id, kinds, limit=25)
+    scores: dict[str, float] = {}
+    by_key: dict[str, Hit] = {}
+    for ranked in (fts, vec):
+        for rank, h in enumerate(ranked):
+            scores[h.key] = scores.get(h.key, 0.0) + 1.0 / (60 + rank) * (1.3 if h.is_file else 1.0)
+            by_key.setdefault(h.key, h)
+    best = sorted(scores, key=lambda k: -scores[k])[:limit]
+    return [by_key[k] for k in best]

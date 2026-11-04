@@ -63,25 +63,56 @@ def pdf_text(data: bytes) -> str:
     return "\n".join((p.extract_text() or "") for p in reader.pages[:400])
 
 
+def _is_num(c: str) -> bool:
+    return bool(re.fullmatch(r"[$\u20ac]?-?[\d,]*\.?\d+%?", c.replace(" ", "")))
+
+
+def _is_header(r: list[str], nxt: list[str]) -> bool:
+    """Header row: 3+ short text (non numeric) cells, and the next row fills 2+ of those columns."""
+    filled = [c for c in r if c]
+    if len(filled) < 3 or any(len(c) > 60 or _is_num(c) for c in filled):
+        return False
+    return sum(1 for j, c in enumerate(r) if c and j < len(nxt) and nxt[j]) >= 2
+
+
 def xlsx_text(data: bytes, max_rows: int = 5000) -> str:
-    """Every tab of a workbook as text: a header per sheet, then comma separated rows (computed values)."""
+    """Every tab of a workbook as text. Table rows are written as 'Column: value' records so each
+    line keeps its meaning on its own (which number is the mass, which is the price...).
+    A blank row ends a table, so several tables stacked on one tab are each read correctly."""
     from openpyxl import load_workbook
 
     wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     parts = []
     for ws in wb.worksheets:
-        rows = []
+        rows: list[list[str]] = []
         for i, row in enumerate(ws.iter_rows(values_only=True)):
             if i >= max_rows:
-                rows.append("(more rows not shown)")
                 break
-            cells = ["" if v is None else str(v).strip() for v in row]
+            cells = ["" if v is None else re.sub(r"\s+", " ", str(v)).strip() for v in row]
             while cells and not cells[-1]:
                 cells.pop()
-            if any(cells):
-                rows.append(", ".join(cells))
-        if rows:
-            parts.append(f"## Sheet: {ws.title}\n" + "\n".join(rows))
+            rows.append(cells)
+        out, seen, header = [], set(), None
+        for i, r in enumerate(rows):
+            if not any(r):
+                header = None
+                continue
+            nxt = next((x for x in rows[i + 1:i + 2]), [])
+            if header is None and _is_header(r, nxt):
+                header = r
+                line = f"[{ws.title}] columns: " + " | ".join(c for c in r if c)
+            elif header is not None:
+                pairs = [f"{header[j] if j < len(header) and header[j] else f'Col{j + 1}'}: {c}"
+                         for j, c in enumerate(r) if c]
+                line = f"[{ws.title}] " + "; ".join(pairs)
+            else:
+                # free text or label/value lines; merged cells repeat, keep one copy
+                line = f"[{ws.title}] " + " | ".join(dict.fromkeys(c for c in r if c))
+            if line not in seen:
+                seen.add(line)
+                out.append(line)
+        if out:
+            parts.append(f"## Sheet: {ws.title}\n" + "\n".join(out))
     return "\n\n".join(parts)
 
 

@@ -15,13 +15,13 @@ import discord
 from discord import app_commands
 from discord.ext import voice_recv
 
-from .assistant import (HELP_TEXT, answer_question, answer_with_hits, format_docs, format_find, parse_command,
+from .assistant import (HELP_TEXT, answer_question, answer_with_hits, embedder_for, format_docs, format_find, parse_command,
                         parse_wake, source_links, wake_pattern)
 from .speech import Speaker, speakable
 from .config import Config
 from .drive import DriveAuth, DriveIndexer
 from .indexer import Indexer
-from .knowledge import KnowledgeBase
+from .knowledge import KnowledgeBase, embed_pending
 from .live import LiveListener, get_live_model
 from .merge import Segment, chunk_text, coalesce, render_transcript
 from .minutes import generate_minutes
@@ -140,6 +140,7 @@ class MinutesBot(discord.Client):
         self.coord.indexer.start()
         self.coord.indexer.on_new_folder = self._on_new_folder
         self._spawn(self.coord.drive.refresh_loop(self._home_guild_id))
+        self._spawn(self._embed_loop())
         self._spawn(self._resume_unprocessed())
 
     async def on_ready(self) -> None:
@@ -352,7 +353,7 @@ class MinutesBot(discord.Client):
                 await vc.disconnect(force=True)
             return None
 
-    async def _health(self, session: Session, every: float = 20.0) -> None:
+    async def _health(self, session: Session, every: float = 300.0) -> None:
         """Log whether audio is still arriving, so a silent bot is visible in the logs."""
         last = 0
         while True:
@@ -618,6 +619,20 @@ class MinutesBot(discord.Client):
             await owner.end_session(session.guild_id, reason="notes requested")
             if ch is not None and _humans(ch):
                 await owner.start_session(ch)
+
+    async def _embed_loop(self) -> None:
+        """Keep meaning based search up to date: embed new chunks in the background."""
+        emb = embedder_for(self.cfg)
+        if emb is None:
+            return
+        while True:
+            try:
+                n = await embed_pending(self.coord.kb, emb)
+                if n:
+                    log.info("embedded %d new chunks for meaning based search", n)
+            except Exception:
+                log.exception("embedding loop failed")
+            await asyncio.sleep(30)
 
     def _home_guild_id(self) -> Optional[int]:
         """Guild that files shared directly with Rocky's Drive account belong to."""

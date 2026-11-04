@@ -9,7 +9,7 @@ from typing import Optional
 
 from . import llm
 from .config import Config
-from .knowledge import Hit, KnowledgeBase
+from .knowledge import Embedder, Hit, KnowledgeBase, hybrid_search
 
 log = logging.getLogger(__name__)
 
@@ -161,9 +161,16 @@ def sources_block(hits: list[Hit], max_chars: int = 14_000) -> str:
     return "\n".join(out)
 
 
+DOC_RULES = (
+    "Sources may be spreadsheet rows written as 'Column: value' pairs, tagged with the tab name in brackets. "
+    "Read the column names carefully (mass each vs total mass, price each vs total). When the question needs a "
+    "total, difference or margin, compute it from the rows and show the numbers you used. Say how current a value "
+    "is when the source gives a date or a status such as Picked, Leading, Open or TBD. "
+)
+
 ASK_SYSTEM = (
     "You are Rocky, the assistant inside a team's Discord server. Answer the question using only the sources "
-    "and the live meeting transcript provided. Be brief: under 120 words unless the question needs more. "
+    "and the live meeting transcript provided. " + DOC_RULES + "Be brief: under 120 words unless the question needs more. "
     "Cite sources inline as [1], [2] and end with the links you cited, one per line, wrapped in <> so Discord "
     "does not embed them. If the sources do not contain the answer, say so in one sentence and suggest where "
     "it might be. Use plain Discord markdown. Do not use hyphens or em dashes; use commas or new sentences."
@@ -172,19 +179,25 @@ ASK_SYSTEM = (
 
 VOICE_SYSTEM = (
     "You are Rocky, the team's assistant, answering OUT LOUD in a Discord voice call. Use only the sources and the live "
-    "meeting transcript provided. Reply in one to three short spoken sentences: plain conversational English, no lists, "
+    "meeting transcript provided. " + DOC_RULES + "Reply in one to three short spoken sentences: plain conversational English, no lists, "
     "no links, no citations, no markdown, numbers written the way you'd say them. Personality: calm, precise, dry and "
     "deadpan, like a seasoned mission robot; a brief wry aside is fine now and then, but the answer always comes first. "
     "If the sources don't have the answer, say so in one sentence and say where it might be found."
 )
 
 
+def embedder_for(cfg: Config) -> Embedder | None:
+    return Embedder(cfg.ollama_url, cfg.embed_model) if (cfg.ollama_url and cfg.embed_model) else None
+
+
 def source_links(hits: list[Hit], limit: int = 3) -> str:
-    out = []
-    for h in hits[:limit]:
+    out, seen = [], set()
+    for h in hits:
+        if len(out) >= limit or not h.url or h.url in seen:
+            continue
+        seen.add(h.url)
         label = _clean(h.title if h.is_file else (h.snippet or h.title))[:70] or "source"
-        if h.url:
-            out.append(f"[{label}]({h.url})")
+        out.append(f"[{label}]({h.url})")
     return ("Sources: " + " · ".join(out)) if out else ""
 
 
@@ -196,7 +209,7 @@ async def answer_question(cfg: Config, kb: KnowledgeBase, guild_id: int, questio
 
 async def answer_with_hits(cfg: Config, kb: KnowledgeBase, guild_id: int, question: str, asker: str,
                            meeting_so_far: str = "", spoken: bool = False) -> tuple[str, list[Hit]]:
-    hits = kb.search(question, guild_id=guild_id, limit=8)
+    hits = await hybrid_search(kb, embedder_for(cfg), question, guild_id, limit=10)
     if not llm.enabled(cfg):
         if spoken:
             return ("I can't form answers without a language model, but I posted the closest matches in the chat.", hits)

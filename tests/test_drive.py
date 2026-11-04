@@ -126,3 +126,28 @@ def test_discover_shared_needs_no_link(tmp_path, monkeypatch):
     assert hit.channel == "Drive: Shared with Rocky" and "MA Workbook" in hit.title
     assert asyncio.run(d.discover_shared(1)) == (0, 0)  # nothing new the second time
     assert asyncio.run(d.discover_shared(None)) == (0, 0)
+
+
+def test_hybrid_search_finds_by_meaning(tmp_path):
+    import numpy as np
+    from bot.knowledge import embed_pending, hybrid_search
+
+    kb = KnowledgeBase(tmp_path / "kb.db")
+    kb.upsert("gdrive:parts", "gdoc", 1, "Drive: Shared with Rocky", "Google Drive", "https://x/parts",
+              "Google Sheet: Rover Parts List", "[Totals] Section: Mobility; Total mass (kg): 25", 0)
+    kb.upsert("msg:1", "msg", 1, "general", "fire", "https://x/m", "hi", "lunch at noon tomorrow", 0)
+
+    class FakeEmb:
+        ok = True
+        async def embed(self, texts, query=False):
+            # "heavy" and "mass" land near each other; everything else far away
+            vs = [[1.0, 0.0] if any(w in t.lower() for w in ("heavy", "mass")) else [0.0, 1.0] for t in texts]
+            return np.asarray(vs, dtype=np.float32)
+
+    assert asyncio.run(embed_pending(kb, FakeEmb())) == 2
+    assert kb.search("how heavy is the rover", guild_id=1) == []  # keywords alone miss it
+    hits = asyncio.run(hybrid_search(kb, FakeEmb(), "how heavy is the rover", 1))
+    assert hits and hits[0].key == "gdrive:parts"
+    kb.delete("gdrive:parts")
+    with kb._lock:
+        assert kb.db.execute("SELECT count(*) FROM vecs").fetchone()[0] == 1  # vector removed with its chunk
