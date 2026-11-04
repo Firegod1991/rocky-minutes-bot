@@ -52,7 +52,9 @@ async def _complete(cfg: Config, p: str, system: str, user: str, max_tokens: int
         url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         body = {
             "model": cfg.gemini_model,
-            "max_tokens": max_tokens,
+            # thinking tokens count against max_tokens on Gemini 3.x: keep thinking light and leave headroom
+            "reasoning_effort": "low",
+            "max_tokens": max_tokens + 2048,
             "temperature": 0.2,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         }
