@@ -1,6 +1,7 @@
 """One call for "ask a language model": Claude if a key is set, otherwise local Ollama."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import aiohttp
@@ -57,10 +58,16 @@ async def _complete(cfg: Config, p: str, system: str, user: str, max_tokens: int
         }
         headers = {"Authorization": f"Bearer {cfg.gemini_api_key}"}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as s:
-            async with s.post(url, json=body, headers=headers) as r:
-                if r.status != 200:
-                    raise RuntimeError(f"gemini HTTP {r.status}: {(await r.text())[:300]}")
-                data = await r.json()
+            for attempt, wait in enumerate((2, 5, 0)):
+                async with s.post(url, json=body, headers=headers) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        break
+                    err = f"gemini HTTP {r.status}: {(await r.text())[:300]}"
+                # busy or rate limited: brief backoff before giving up to the fallback
+                if r.status not in (429, 500, 503) or not wait:
+                    raise RuntimeError(err)
+                await asyncio.sleep(wait)
         return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "").strip()
     if p == "ollama":
         body = {
