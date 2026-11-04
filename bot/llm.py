@@ -30,9 +30,16 @@ async def complete(cfg: Config, system: str, user: str, max_tokens: int = 1500, 
     p = provider(cfg)
     try:
         return await _complete(cfg, p, system, user, max_tokens, fast)
-    except Exception:
+    except Exception as e:
+        # main Gemini model busy or out of free quota: the lite model has its own quota, try it first
+        if p == "gemini" and not fast and cfg.gemini_fast_model and cfg.gemini_fast_model != cfg.gemini_model:
+            log.warning("gemini %s failed (%s); trying %s", cfg.gemini_model, str(e)[:60], cfg.gemini_fast_model)
+            try:
+                return await _complete(cfg, p, system, user, max_tokens, True)
+            except Exception:
+                pass
         if p != "ollama" and cfg.ollama_url and cfg.ollama_model:
-            log.exception("%s failed; falling back to local Ollama", p)
+            log.warning("%s failed; falling back to local Ollama", p)
             return await _complete(cfg, "ollama", system, user, max_tokens, fast)
         raise
 

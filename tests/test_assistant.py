@@ -173,7 +173,7 @@ def test_cloud_failure_falls_back_to_ollama(monkeypatch):
     monkeypatch.setattr(llm, "_complete", fake)
     cfg = Config(discord_token="x", anthropic_api_key="", gemini_api_key="g", ollama_url="http://x")
     assert asyncio.run(llm.complete(cfg, "s", "u")) == "local answer"
-    assert seen == ["gemini", "ollama"]
+    assert seen == ["gemini", "gemini", "ollama"]  # main model, then lite model, then local
 
 
 def test_sentences_split_and_glue():
