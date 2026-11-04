@@ -139,7 +139,7 @@ class MinutesBot(discord.Client):
             log.info("slash commands synced globally (can take up to an hour to appear)")
         self.coord.indexer.start()
         self.coord.indexer.on_new_folder = self._on_new_folder
-        self._spawn(self.coord.drive.refresh_loop())
+        self._spawn(self.coord.drive.refresh_loop(self._home_guild_id))
         self._spawn(self._resume_unprocessed())
 
     async def on_ready(self) -> None:
@@ -618,6 +618,12 @@ class MinutesBot(discord.Client):
             await owner.end_session(session.guild_id, reason="notes requested")
             if ch is not None and _humans(ch):
                 await owner.start_session(ch)
+
+    def _home_guild_id(self) -> Optional[int]:
+        """Guild that files shared directly with Rocky's Drive account belong to."""
+        if self.cfg.guild_ids:
+            return sorted(self.cfg.guild_ids)[0]
+        return self.guilds[0].id if self.guilds else None
 
     async def _on_new_folder(self, folder: dict, message: discord.Message) -> None:
         """Someone posted a Drive folder link: read it and say how it went, in that channel."""

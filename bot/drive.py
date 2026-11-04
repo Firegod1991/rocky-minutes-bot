@@ -28,9 +28,10 @@ FOLDER_RE = re.compile(r"https?://drive\.google\.com/drive/(?:u/\d+/)?folders/(?
 API = "https://www.googleapis.com/drive/v3"
 SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 FOLDER_MIME = "application/vnd.google-apps.folder"
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 EXPORTS = {
     "application/vnd.google-apps.document": ("text/plain", "Google Doc"),
-    "application/vnd.google-apps.spreadsheet": ("text/csv", "Google Sheet"),
+    "application/vnd.google-apps.spreadsheet": (XLSX, "Google Sheet"),
     "application/vnd.google-apps.presentation": ("text/plain", "Google Slides"),
 }
 DOWNLOADS = {
@@ -39,6 +40,7 @@ DOWNLOADS = {
     "text/markdown": "Markdown file",
     "text/csv": "CSV file",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "Word doc",
+    XLSX: "Excel workbook",
 }
 MAX_BYTES = 25_000_000
 MAX_FILES = 3000
@@ -59,6 +61,28 @@ def pdf_text(data: bytes) -> str:
 
     reader = PdfReader(io.BytesIO(data))
     return "\n".join((p.extract_text() or "") for p in reader.pages[:400])
+
+
+def xlsx_text(data: bytes, max_rows: int = 5000) -> str:
+    """Every tab of a workbook as text: a header per sheet, then comma separated rows (computed values)."""
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    parts = []
+    for ws in wb.worksheets:
+        rows = []
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            if i >= max_rows:
+                rows.append("(more rows not shown)")
+                break
+            cells = ["" if v is None else str(v).strip() for v in row]
+            while cells and not cells[-1]:
+                cells.pop()
+            if any(cells):
+                rows.append(", ".join(cells))
+        if rows:
+            parts.append(f"## Sheet: {ws.title}\n" + "\n".join(rows))
+    return "\n\n".join(parts)
 
 
 def docx_text(data: bytes) -> str:
@@ -231,13 +255,18 @@ class DriveIndexer:
 
     async def read(self, f: DriveFile) -> str:
         if f.mime in EXPORTS:
-            data = await self._get(f"/files/{f.id}/export", {"mimeType": EXPORTS[f.mime][0]}, raw=True)
-            return data.decode("utf-8", errors="replace").lstrip("﻿")
+            target = EXPORTS[f.mime][0]
+            data = await self._get(f"/files/{f.id}/export", {"mimeType": target}, raw=True)
+            if target == XLSX:
+                return await asyncio.get_running_loop().run_in_executor(None, xlsx_text, data)
+            return data.decode("utf-8", errors="replace").lstrip("\ufeff")
         data = await self._get(f"/files/{f.id}", {"alt": "media", "supportsAllDrives": "true"}, raw=True)
         if f.mime == "application/pdf":
             return await asyncio.get_running_loop().run_in_executor(None, pdf_text, data)
         if f.mime.endswith("wordprocessingml.document"):
             return docx_text(data)
+        if f.mime == XLSX:
+            return await asyncio.get_running_loop().run_in_executor(None, xlsx_text, data)
         return data.decode("utf-8", errors="replace")
 
     # crawl --------------------------------------------------------------------
@@ -256,38 +285,7 @@ class DriveIndexer:
                 log.warning("drive folder %s not readable: %s", fid, e)
                 self._set_folder(fid, status="no_access", last_crawl=time.time())
                 return "no_access"
-            with self.kb._lock:
-                known = dict(self.db.execute("SELECT file_id, modified FROM drive_files WHERE folder_id = ?", (fid,)).fetchall())
-            ok = skipped = failed = 0
-            current = set()
-            for f in files:
-                current.add(f.id)
-                if not force and known.get(f.id) == f.modified:
-                    skipped += 1
-                    continue
-                label = EXPORTS.get(f.mime, (None, DOWNLOADS.get(f.mime, "File")))[1]
-                try:
-                    text = await self.read(f)
-                    status = "ok" if text.strip() else "empty"
-                except Exception as e:
-                    log.info("drive file %s (%s) unreadable: %s", f.name, f.id, str(e)[:120])
-                    text, status = "", "error"
-                    failed += 1
-                body = text if text.strip() else f"{f.name} (contents could not be read)"
-                self.kb.upsert(f"gdrive:{f.id}", "gdoc", guild_id, f"Drive: {f.path}", "Google Drive", f.url,
-                               f"{label}: {f.name}", body, time.time())
-                with self.kb._lock:
-                    self.db.execute("INSERT OR REPLACE INTO drive_files(file_id, folder_id, modified, status) VALUES (?,?,?,?)",
-                                    (f.id, fid, f.modified, status))
-                    self.db.commit()
-                ok += status == "ok"
-                await asyncio.sleep(0.1)
-            # forget files that were removed from the folder
-            for gone in set(known) - current:
-                self.kb.delete(f"gdrive:{gone}")
-                with self.kb._lock:
-                    self.db.execute("DELETE FROM drive_files WHERE file_id = ?", (gone,))
-                    self.db.commit()
+            ok, skipped, failed = await self._index_files(fid, guild_id, files, force)
             self._set_folder(fid, status="ok", name=root_name, files=len(files), last_crawl=time.time())
             log.info("drive folder %r: %d files (%d updated, %d unchanged, %d unreadable)",
                      root_name, len(files), ok, skipped, failed)
@@ -295,15 +293,93 @@ class DriveIndexer:
         finally:
             self._busy.discard(fid)
 
-    async def refresh_loop(self) -> None:
+    async def _index_files(self, fid: str, guild_id: int, files: list[DriveFile], force: bool = False) -> tuple[int, int, int]:
+        """Index changed files under a folder key, drop files that disappeared. Returns (updated, unchanged, failed)."""
+        with self.kb._lock:
+            known = dict(self.db.execute("SELECT file_id, modified FROM drive_files WHERE folder_id = ?", (fid,)).fetchall())
+        ok = skipped = failed = 0
+        current = set()
+        for f in files:
+            current.add(f.id)
+            if not force and known.get(f.id) == f.modified:
+                skipped += 1
+                continue
+            label = EXPORTS.get(f.mime, (None, DOWNLOADS.get(f.mime, "File")))[1]
+            try:
+                text = await self.read(f)
+                status = "ok" if text.strip() else "empty"
+            except Exception as e:
+                log.info("drive file %s (%s) unreadable: %s", f.name, f.id, str(e)[:120])
+                text, status = "", "error"
+                failed += 1
+            body = text if text.strip() else f"{f.name} (contents could not be read)"
+            self.kb.upsert(f"gdrive:{f.id}", "gdoc", guild_id, f"Drive: {f.path}", "Google Drive", f.url,
+                           f"{label}: {f.name}", body, time.time())
+            with self.kb._lock:
+                self.db.execute("INSERT OR REPLACE INTO drive_files(file_id, folder_id, modified, status) VALUES (?,?,?,?)",
+                                (f.id, fid, f.modified, status))
+                self.db.commit()
+            ok += status == "ok"
+            await asyncio.sleep(0.1)
+        # forget files that were removed from the folder
+        for gone in set(known) - current:
+            self.kb.delete(f"gdrive:{gone}")
+            with self.kb._lock:
+                self.db.execute("DELETE FROM drive_files WHERE file_id = ?", (gone,))
+                self.db.commit()
+        return ok, skipped, failed
+
+    async def discover_shared(self, guild_id: Optional[int]) -> tuple[int, int]:
+        """Pick up everything people shared with Rocky's account: folders get crawled, files get indexed.
+
+        Returns (new_folders, files_indexed). No Discord link needed.
+        """
+        if guild_id is None or self.auth.mode != "service_account":
+            return 0, 0
+        items, token = [], None
         while True:
+            params = {
+                "q": "sharedWithMe = true and trashed = false",
+                "fields": "nextPageToken, files(id, name, mimeType, modifiedTime, webViewLink, shortcutDetails)",
+                "pageSize": "1000", "supportsAllDrives": "true", "includeItemsFromAllDrives": "true",
+            }
+            if token:
+                params["pageToken"] = token
+            data = await self._get("/files", params)
+            items += data.get("files", [])
+            token = data.get("nextPageToken")
+            if not token:
+                break
+        new_folders, files = 0, []
+        for f in items:
+            mime = f.get("mimeType", "")
+            if mime == FOLDER_MIME:
+                url = f.get("webViewLink") or f"https://drive.google.com/drive/folders/{f['id']}"
+                if self.add_folder(f["id"], guild_id, url, "shared with Rocky"):
+                    new_folders += 1
+                continue
+            if mime in EXPORTS or mime in DOWNLOADS or f["name"].lower().endswith((".md", ".txt", ".csv")):
+                files.append(DriveFile(f["id"], f["name"], mime, f.get("modifiedTime", ""),
+                                       f.get("webViewLink", f"https://drive.google.com/file/d/{f['id']}/view"),
+                                       "Shared with Rocky"))
+        ok, _, _ = await self._index_files("__shared__", guild_id, files)
+        if new_folders or ok:
+            log.info("drive: discovered %d new shared folders, indexed %d shared files", new_folders, ok)
+        return new_folders, ok
+
+    async def refresh_loop(self, guild_id_fn=None) -> None:
+        while True:
+            try:
+                await self.discover_shared(guild_id_fn() if guild_id_fn else None)
+            except Exception:
+                log.exception("drive discovery failed")
             for f in self.folders():
                 if time.time() - (f["last_crawl"] or 0) >= self.refresh_hours * 3600 or f["status"] in ("new",):
                     try:
                         await self.crawl(f)
                     except Exception:
                         log.exception("drive crawl failed for %s", f["folder_id"])
-            await asyncio.sleep(300)
+            await asyncio.sleep(120)
 
     async def close(self) -> None:
         if self._http:

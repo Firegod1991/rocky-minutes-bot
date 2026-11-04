@@ -19,11 +19,30 @@ TREE = {
     ],
     "deep": [{"id": "notes", "name": "notes.txt", "mimeType": "text/plain", "modifiedTime": "1"}],
 }
+def _xlsx(sheets):
+    from openpyxl import Workbook
+    wb = Workbook()
+    wb.remove(wb.active)
+    for title, rows in sheets.items():
+        ws = wb.create_sheet(title)
+        for r in rows:
+            ws.append(r)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 CONTENT = {
     "doc1": b"Flight computer: dual redundant ARM boards.",
-    "sheet1": b"subsystem,mass_kg\nchassis,62\ntotal,155\nmargin,12",
+    "sheet1": _xlsx({"Mass": [["subsystem", "mass_kg"], ["chassis", 62], ["total", 155]],
+                     "Margins": [["item", "kg"], ["margin", 12]]}),
     "notes": b"radiator panels sized for 40 W",
+    "shared1": b"Mission assurance risk: battery thermal runaway, likelihood 2, impact 5",
 }
+SHARED = [
+    {"id": "shared1", "name": "MA Workbook notes", "mimeType": "text/plain", "modifiedTime": "1"},
+    {"id": "sharedfolder", "name": "Team Folder", "mimeType": FOLDER_MIME},
+]
 
 
 class FakeDrive(DriveIndexer):
@@ -36,6 +55,8 @@ class FakeDrive(DriveIndexer):
         if self.deny:
             raise PermissionError("404: not found")
         if path == "/files":
+            if params["q"].startswith("sharedWithMe"):
+                return {"files": SHARED}
             fid = params["q"].split("'")[1]
             return {"files": TREE.get(fid, [])}
         if path.startswith("/files/") and not raw:
@@ -61,6 +82,8 @@ def test_crawl_recurses_reads_and_is_searchable(tmp_path):
     hits = kb.search("total mass budget", guild_id=1)
     assert hits and "Mass Budget" in hits[0].title and hits[0].channel == "Drive: Team Docs / Engineering"
     assert kb.search("radiator", guild_id=1)[0].channel == "Drive: Team Docs / Engineering / Thermal"
+    margin = kb.search("margin", guild_id=1)  # second tab of the workbook is read too
+    assert margin and "## Sheet: Margins" in margin[0].body
     assert len(kb.list_drive_files(1)) == 3
     # second crawl: nothing changed, nothing re-downloaded
     d.calls.clear()
@@ -90,3 +113,16 @@ def test_docx_text():
     with zipfile.ZipFile(buf, "w") as z:
         z.writestr("word/document.xml", "<w:document><w:p><w:r><w:t>Hello</w:t></w:r></w:p><w:p><w:t>Rover</w:t></w:p></w:document>")
     assert docx_text(buf.getvalue()).split() == ["Hello", "Rover"]
+
+
+def test_discover_shared_needs_no_link(tmp_path, monkeypatch):
+    kb = KnowledgeBase(tmp_path / "kb.db")
+    d = FakeDrive(kb)
+    monkeypatch.setattr(DriveAuth, "mode", property(lambda self: "service_account"))
+    new_folders, files = asyncio.run(d.discover_shared(1))
+    assert (new_folders, files) == (1, 1)
+    assert any(f["folder_id"] == "sharedfolder" for f in d.folders(1))
+    hit = kb.search("battery thermal runaway", guild_id=1)[0]
+    assert hit.channel == "Drive: Shared with Rocky" and "MA Workbook" in hit.title
+    assert asyncio.run(d.discover_shared(1)) == (0, 0)  # nothing new the second time
+    assert asyncio.run(d.discover_shared(None)) == (0, 0)
