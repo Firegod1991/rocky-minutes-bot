@@ -147,3 +147,12 @@ def test_minutes_long_meeting_chunked_on_local_model(monkeypatch):
 
     cfg2 = Config(discord_token="x", anthropic_api_key="", ollama_url="")
     assert not llm.enabled(cfg2)
+
+
+def test_provider_order():
+    from bot import llm
+    from bot.config import Config
+    base = dict(discord_token="x", ollama_url="http://x")
+    assert llm.provider(Config(**base, anthropic_api_key="a", gemini_api_key="g")) == "claude"
+    assert llm.provider(Config(**base, anthropic_api_key="", gemini_api_key="g")) == "gemini"
+    assert llm.provider(Config(**base, anthropic_api_key="", gemini_api_key="")) == "ollama"

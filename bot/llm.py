@@ -13,6 +13,8 @@ log = logging.getLogger(__name__)
 def provider(cfg: Config) -> str:
     if cfg.anthropic_api_key:
         return "claude"
+    if cfg.gemini_api_key:
+        return "gemini"
     if cfg.ollama_url and cfg.ollama_model:
         return "ollama"
     return ""
@@ -33,6 +35,22 @@ async def complete(cfg: Config, system: str, user: str, max_tokens: int = 1500) 
             messages=[{"role": "user", "content": user}],
         )
         return "".join(getattr(b, "text", "") for b in resp.content).strip()
+    if p == "gemini":
+        # Gemini's OpenAI compatible endpoint
+        url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        body = {
+            "model": cfg.gemini_model,
+            "max_tokens": max_tokens,
+            "temperature": 0.2,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        }
+        headers = {"Authorization": f"Bearer {cfg.gemini_api_key}"}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as s:
+            async with s.post(url, json=body, headers=headers) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"gemini HTTP {r.status}: {(await r.text())[:300]}")
+                data = await r.json()
+        return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "").strip()
     if p == "ollama":
         body = {
             "model": cfg.ollama_model,

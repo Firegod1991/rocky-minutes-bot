@@ -42,7 +42,10 @@ class Config:
     post_transcript_inline: bool = field(default_factory=lambda: _bool("POST_TRANSCRIPT_INLINE", True))
     anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
     claude_model: str = field(default_factory=lambda: os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5"))
-    # Free local fallback when no Anthropic key is set. Empty OLLAMA_URL disables it.
+    # Google Gemini (key from https://aistudio.google.com/apikey). Used when set and no Anthropic key.
+    gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
+    gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
+    # Free local fallback when no cloud key is set. Empty OLLAMA_URL disables it.
     ollama_url: str = field(default_factory=lambda: os.getenv("OLLAMA_URL", "http://host.docker.internal:11434"))
     ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "qwen3:8b"))
     ollama_ctx: int = field(default_factory=lambda: _int("OLLAMA_CTX", 16384))

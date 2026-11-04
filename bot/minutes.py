@@ -121,7 +121,7 @@ def _local_budget(cfg) -> int:
 
 
 async def _ask_llm(cfg, title, started, duration_s, participants, transcript, extra="") -> str:
-    limit = MAX_TRANSCRIPT_CHARS if llm.provider(cfg) == "claude" else _local_budget(cfg)
+    limit = _local_budget(cfg) if llm.provider(cfg) == "ollama" else MAX_TRANSCRIPT_CHARS
     if len(transcript) > limit:
         # long meeting on a small context model: summarize in parts, then write minutes from the part notes
         lines, parts, cur = transcript.splitlines(keepends=True), [], ""
