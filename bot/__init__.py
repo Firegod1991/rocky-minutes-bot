@@ -1,0 +1,1 @@
+"""Discord meeting minutes bot."""
